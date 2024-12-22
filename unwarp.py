@@ -48,7 +48,7 @@ def parse_args():
                            required=True)
     arguments.add_argument('-s',
                            '--domainsearch',
-                           help='networkmanager connection name',
+                           help='domains search for connection (space-separated list of domain names)',
                            default=None)
     arguments.add_argument('-c',
                            '--nmconnectionpath',
@@ -184,6 +184,8 @@ def create_nm_config(warpconfig, wgconfig, ifname, nmname, ipv4only, dnssearch):
     nmconfig.set('ipv4', 'dns', '1.1.1.1')
     nmconfig.set('ipv4', 'method', 'manual')
     if dnssearch:
+        LOG.info('adding following domains search in ipv4 section: %s',
+                 dnssearch)
         nmconfig.set('ipv4', 'dns-search', ';'.join(dnssearch.split()) + ';')
     for number in range(0, len(routes4)):
         nmconfig.set('ipv4', f'route{number+1}', routes4[number])
@@ -197,6 +199,8 @@ def create_nm_config(warpconfig, wgconfig, ifname, nmname, ipv4only, dnssearch):
         nmconfig.set('ipv6', 'address1', f'{warpconfig["interface"]["v6"]}/128')
         nmconfig.set('ipv6', 'dns', '2606:4700:4700::1111')
         if dnssearch:
+            LOG.info('adding following domains search in ipv6 section: %s',
+                     dnssearch)
             nmconfig.set('ipv6', 'dns-search', ';'.join(dnssearch.split()) + ';')
         nmconfig.set('ipv6', 'method', 'manual')
         for number in range(0, len(routes6)):
