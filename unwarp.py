@@ -46,6 +46,10 @@ def parse_args():
                            '--nmconnectionname',
                            help='networkmanager connection name',
                            required=True)
+    arguments.add_argument('-s',
+                           '--domainsearch',
+                           help='networkmanager connection name',
+                           default=None)
     arguments.add_argument('-c',
                            '--nmconnectionpath',
                            help='networkmanager connections path (default location needs root for writing)',
@@ -151,7 +155,7 @@ def get_routes(warpconfig):
                     routes6.append(raw_route['address'])
     return routes4, routes6
 
-def create_nm_config(warpconfig, wgconfig, ifname, nmname, ipv4only):
+def create_nm_config(warpconfig, wgconfig, ifname, nmname, ipv4only, dnssearch):
     '''
     create networkmanager wireguard connection from cloudflare warp config
     '''
@@ -179,6 +183,8 @@ def create_nm_config(warpconfig, wgconfig, ifname, nmname, ipv4only):
     nmconfig.set('ipv4', 'address1', f'{warpconfig["interface"]["v4"]}/32')
     nmconfig.set('ipv4', 'dns', '1.1.1.1')
     nmconfig.set('ipv4', 'method', 'manual')
+    if dnssearch:
+        nmconfig.set('ipv4', 'dns-search', ';'.join(dnssearch.split()) + ';')
     for number in range(0, len(routes4)):
         nmconfig.set('ipv4', f'route{number+1}', routes4[number])
     if ipv4only:
@@ -190,6 +196,8 @@ def create_nm_config(warpconfig, wgconfig, ifname, nmname, ipv4only):
         nmconfig.set('ipv6', 'addr-gen-mode', 'eui64')
         nmconfig.set('ipv6', 'address1', f'{warpconfig["interface"]["v6"]}/128')
         nmconfig.set('ipv6', 'dns', '2606:4700:4700::1111')
+        if dnssearch:
+            nmconfig.set('ipv6', 'dns-search', ';'.join(dnssearch.split()) + ';')
         nmconfig.set('ipv6', 'method', 'manual')
         for number in range(0, len(routes6)):
             nmconfig.set('ipv6', f'route{number+1}', routes6[number])
@@ -250,7 +258,7 @@ def main():
     except IOError:
         return 1
     try:
-        nmconfig = create_nm_config(warpconfig, wgconfig, args.interface, args.nmconnectionname, args.ipv4only)
+        nmconfig = create_nm_config(warpconfig, wgconfig, args.interface, args.nmconnectionname, args.ipv4only, args.domainsearch)
     except KeyError as warpconf_ex:
         LOG.error('missing parts in cloudflare warp configuration: %s',
                   warpconf_ex)
