@@ -144,7 +144,7 @@ def get_routes(warpconfig):
     '''
     get routes list from cloudflare warp configuration
     '''
-    routes4 = []
+    routes4 = ['1.1.1.1/32']
     routes6 = []
     if 'policy' in warpconfig:
         for raw_route in warpconfig['policy']['include']:
@@ -200,7 +200,7 @@ def create_nm_config(warpconfig, wgconfig, ifname, nmname, ipv4only, dnssearch):
         nmconfig.set('ipv6', 'dns', '2606:4700:4700::1111')
         if dnssearch:
             LOG.info('adding following domains search in ipv6 section: %s',
-                     dnssearch)
+                     dnsearch)
             nmconfig.set('ipv6', 'dns-search', ';'.join(dnssearch.split()) + ';')
         nmconfig.set('ipv6', 'method', 'manual')
         for number in range(0, len(routes6)):
