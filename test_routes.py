@@ -21,8 +21,8 @@ POLICY = {
     'include': [{'address': '192.0.2.5/24'}, {'address': '192.0.2.0/24'},
                 {'address': '2001:db8::/48'}, {'host': '*.example.test'}],
     'exclude': None,
-    'always_include': [{'ip': '198.51.100.1'}],
-    'always_exclude': [{'ip': '192.0.2.0/25'}],
+    'always_include': [{'ip': '198.51.100.1'}, {'ip': '2001:db8:1::1'}],
+    'always_exclude': [{'ip': '192.0.2.0/25'}, {'ip': '2001:db8:2::/64'}],
 }
 
 
@@ -55,8 +55,16 @@ class RoutesTest(unittest.TestCase):
         self.assertEqual((method, path), ('GET', f'/v1/accounts/{ACCOUNT}/reg/{DEVICE}'))
         self.assertEqual(self.session.request.call_args.kwargs['headers']['Authorization'], 'Bearer test-credential')
         self.assertEqual(json.loads(self.stdout.getvalue()), {
-            'mode': 'include', 'include': ['192.0.2.0/24', '2001:db8::/48'], 'domains': ['*.example.test'],
+            'mode': 'include', 'include': ['192.0.2.0/24'], 'domains': ['*.example.test'],
             'always_include': ['198.51.100.1/32'], 'always_exclude': ['192.0.2.0/25'],
+        })
+        request = self.session.request.call_args
+        self.assertEqual(self.run_command(response, '--dual-stack'), 0)
+        self.assertEqual(self.session.request.call_args, request)
+        self.assertEqual(json.loads(self.stdout.getvalue()), {
+            'mode': 'include', 'include': ['192.0.2.0/24', '2001:db8::/48'], 'domains': ['*.example.test'],
+            'always_include': ['198.51.100.1/32', '2001:db8:1::1/128'],
+            'always_exclude': ['192.0.2.0/25', '2001:db8:2::/64'],
         })
 
     def test_legacy_registration_and_raw_device(self):
@@ -123,7 +131,7 @@ class RoutesTest(unittest.TestCase):
             self.https.assert_not_called()
 
     def test_exclude_can_be_inspected(self):
-        data = {'policy': {'include': [], 'exclude': [{'address': '198.51.100.2'}]}}
+        data = {'policy': {'include': [], 'exclude': [{'address': '198.51.100.2'}, {'address': '2001:db8::/64'}]}}
         self.assertEqual(self.run_command(data), 0)
         self.assertEqual(json.loads(self.stdout.getvalue())['exclude'], ['198.51.100.2/32'])
         with patch('unwarp.nmcli') as nmcli:
@@ -131,18 +139,27 @@ class RoutesTest(unittest.TestCase):
             nmcli.assert_not_called()
 
     @unittest.skipUnless(shutil.which('nmcli'), 'NetworkManager CLI is unavailable')
-    def test_initial_dual_stack_profile_matches_sync(self):
+    def test_initial_profile_route_families(self):
         key = 'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE='
         config = {'policy': POLICY, 'public_key': key, 'endpoints': [{'v4': '192.0.2.254:2408'}],
                   'interface': {'v4': '192.0.2.1', 'v6': '2001:db8::1'}}
-        profile = unwarp.create_nm_config(config, {'secret_key': key}, 'wg-test', 'test', False, None)
-        rendered = io.StringIO()
-        profile.write(rendered)
-        saved = subprocess.check_output(['nmcli', '--offline', 'connection', 'modify', 'connection.id', 'test'],
-                                        input=rendered.getvalue(), text=True)
-        self.assertIn('allowed-ips=0.0.0.0/0;::/0;', saved)
-        self.assertIn('192.0.2.128/25', saved)
-        self.assertIn('2001:db8::/48', saved)
+        for flags, ipv4_only in (([], True), (['--ipv4only'], True), (['--dual-stack'], False)):
+            with self.subTest(flags=flags):
+                args = unwarp.parse_args(['-i', 'wg-test', '-n', 'test', *flags])
+                profile = unwarp.create_nm_config(config, {'secret_key': key}, args.interface,
+                                                  args.nmconnectionname, args.ipv4only, None)
+                rendered = io.StringIO()
+                profile.write(rendered)
+                saved = subprocess.check_output(['nmcli', '--offline', 'connection', 'modify', 'connection.id', 'test'],
+                                                input=rendered.getvalue(), text=True)
+                self.assertIn('192.0.2.128/25', saved)
+                if ipv4_only:
+                    self.assertIn('method=disabled', saved)
+                    self.assertNotIn('::/0', saved)
+                    self.assertNotIn('2001:db8::/48', saved)
+                else:
+                    self.assertIn('allowed-ips=0.0.0.0/0;::/0;', saved)
+                    self.assertIn('2001:db8::/48', saved)
 
     @unittest.skipUnless(shutil.which('nmcli'), 'NetworkManager CLI is unavailable')
     def test_apply_replaces_routes_in_a_real_offline_nm_profile(self):
@@ -180,7 +197,7 @@ class RoutesTest(unittest.TestCase):
 
         with patch('unwarp.nmcli', side_effect=nmcli):
             data = {'policy': POLICY}
-            self.assertEqual(self.run_command(data, '--apply', 'test'), 0)
+            self.assertEqual(self.run_command(data, '--dual-stack', '--apply', 'test'), 0)
             self.assertIn(b'192.0.2.128/25', profile)
             self.assertIn(b'198.51.100.1/32', profile)
             self.assertIn(b'2001:db8::/48', profile)
@@ -196,10 +213,11 @@ class RoutesTest(unittest.TestCase):
             self.assertEqual(len(writes), 1)
             self.assertEqual(reapplied, ['wg-test', 'wg-test'])
             empty = {'policy': {'include': []}}
-            self.assertEqual(self.run_command(empty, '--apply', 'test', '-4'), 0)
+            self.assertEqual(self.run_command(empty, '--apply', 'test'), 0)
             self.assertNotIn(b'192.0.2.128/25', profile)
             self.assertIn(b'1.1.1.1/32', profile)
             self.assertIn(b'2001:db8::/48', profile)
+            self.assertNotIn('ipv6.routes', writes[-1])
 
 
 if __name__ == '__main__':

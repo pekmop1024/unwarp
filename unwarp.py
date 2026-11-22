@@ -22,6 +22,15 @@ from configparser import ConfigParser
 LOG = logging.getLogger(__name__)
 REGISTRATION_FILE = '/var/lib/cloudflare-warp/reg.json'
 
+
+def add_address_family_options(parser):
+    family = parser.add_mutually_exclusive_group()
+    family.add_argument('-4', '--ipv4only', action='store_true', default=True,
+                        help='use only IPv4 routes (default)')
+    family.add_argument('--dual-stack', dest='ipv4only', action='store_false',
+                        help='use both IPv4 and IPv6 routes')
+
+
 def parse_args(argv=None):
     '''
     parse all the command line arguments
@@ -62,10 +71,7 @@ def parse_args(argv=None):
                            '--nmconnectionpath',
                            help='networkmanager connections path (default location needs root for writing)',
                            default='/etc/NetworkManager/system-connections')
-    arguments.add_argument('-4',
-                           '--ipv4only',
-                           action='store_true',
-                           help='ipv4 routes only')
+    add_address_family_options(arguments)
     arguments.add_argument('-f',
                            '--overwrite',
                            action='store_true',
@@ -258,7 +264,7 @@ def routes_command(argv):
     parser = argparse.ArgumentParser(prog='unwarp.py routes',
                                      description='Fetch the registered device split-tunnel routes as JSON.')
     parser.add_argument('-w', '--wgconfig', default=REGISTRATION_FILE, help='WARP registration file')
-    parser.add_argument('-4', '--ipv4only', action='store_true', help='select only IPv4 routes')
+    add_address_family_options(parser)
     parser.add_argument('--apply', metavar='PROFILE',
                         help='replace static routes on a dedicated NetworkManager WireGuard profile (name or UUID)')
     args = parser.parse_args(argv)
