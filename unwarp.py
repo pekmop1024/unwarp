@@ -14,10 +14,11 @@ import fcntl
 import http.client
 import ipaddress
 import subprocess
+import tempfile
 import uuid
 from contextlib import closing
 from subprocess import Popen, PIPE
-from configparser import ConfigParser
+from configparser import ConfigParser, Error as ConfigError
 
 LOG = logging.getLogger(__name__)
 REGISTRATION_FILE = '/var/lib/cloudflare-warp/reg.json'
@@ -29,6 +30,14 @@ def add_address_family_options(parser):
                         help='use only IPv4 routes (default)')
     family.add_argument('--dual-stack', dest='ipv4only', action='store_false',
                         help='use both IPv4 and IPv6 routes')
+
+
+def add_domain_options(parser):
+    domains = parser.add_mutually_exclusive_group()
+    domains.add_argument('-s', '--domainsearch', metavar='DOMAINS',
+                         help='merge extra space-separated DNS search domains with the policy')
+    domains.add_argument('--sync-domains', action='store_true',
+                         help='mirror policy DNS suffixes exactly and report removed local entries (default: merge)')
 
 
 def parse_args(argv=None):
@@ -63,10 +72,7 @@ def parse_args(argv=None):
                            '--nmconnectionname',
                            help='networkmanager connection name',
                            required=True)
-    arguments.add_argument('-s',
-                           '--domainsearch',
-                           help='domains search for connection (space-separated list of domain names)',
-                           default=None)
+    add_domain_options(arguments)
     arguments.add_argument('-c',
                            '--nmconnectionpath',
                            help='networkmanager connections path (default location needs root for writing)',
@@ -218,6 +224,53 @@ def profile_routes(networks, version):
     return sorted(routes)
 
 
+def policy_search_domains(hosts):
+    """Convert Include host rules to the DNS suffixes accepted by NetworkManager."""
+    domains = set()
+    for host in hosts:
+        name = host.strip()
+        if name.startswith('*.'):
+            name = name[2:]
+        if name.endswith('.'):
+            name = name[:-1]
+        try:
+            name = name.encode('idna').decode('ascii').lower()
+        except UnicodeError:
+            raise ValueError('invalid DNS name in the Include policy') from None
+        labels = name.split('.')
+        if len(name) > 253 or not all(re.fullmatch(r'[a-z0-9_-]{1,63}', label) for label in labels):
+            raise ValueError('expected a DNS name or *.domain in the Include policy')
+        domains.add(name)
+    return sorted(domains)
+
+
+def reconcile_domains(current, wanted, sync):
+    """Keep search order in merge mode. Return local suffixes outside the desired list."""
+    def by_name(values):
+        names = {}
+        for domain in values:
+            names.setdefault(domain.lower().rstrip('.'), domain)
+        return names
+
+    existing, desired = by_name(current), by_name(wanted)
+    outside = [domain for name, domain in existing.items() if name not in desired]
+    if sync:
+        return list(desired.values()), outside
+    for name, domain in desired.items():
+        existing.setdefault(name, domain)
+    return list(existing.values()), outside
+
+
+def report_domains(family, outside, sync, dry_run=False):
+    if outside:
+        if sync:
+            action = 'Would remove' if dry_run else 'Removed'
+            print(f'{action} from {family}.dns-search: {", ".join(outside)}', file=sys.stderr)
+        else:
+            print(f'Keeping local {family}.dns-search entries outside the policy: {", ".join(outside)}',
+                  file=sys.stderr)
+
+
 def nmcli(*arguments):
     result = subprocess.run(['nmcli', '--wait', '15', '--escape', 'no', *arguments],
                             capture_output=True, text=True, timeout=20,
@@ -227,28 +280,43 @@ def nmcli(*arguments):
     return result.stdout.splitlines()
 
 
-def apply_routes(profile, networks, ipv4_only):
+def apply_routes(profile, networks, ipv4_only, search_domains=None, sync_domains=False):
     uuid_pattern = r'[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}'
     selector = 'uuid' if re.fullmatch(uuid_pattern, profile, re.IGNORECASE) else 'id'
-    fields = 'connection.uuid,connection.type,wireguard.peer-routes,ipv4.method,ipv4.routes,ipv6.method,ipv6.routes'
+    fields = ('connection.uuid,connection.type,wireguard.peer-routes,'
+              'ipv4.method,ipv4.routes,ipv4.dns-search,ipv6.method,ipv6.routes,ipv6.dns-search')
     properties = nmcli('--get-values', fields, 'connection', 'show', selector, profile)
-    if len(properties) != 7:
+    if len(properties) != 9:
         raise ValueError('expected one NetworkManager connection; use its UUID if the name is ambiguous')
-    profile_uuid, kind, peer_routes, method4, current4, method6, current6 = properties
+    profile_uuid, kind, peer_routes, method4, current4, dns4, method6, current6, dns6 = properties
     if kind != 'wireguard' or peer_routes != 'no':
         raise ValueError('the target must be a WireGuard profile with wireguard.peer-routes disabled')
     if method4 in ('disabled', 'ignore') and (ipv4_only or method6 in ('disabled', 'ignore')):
         raise ValueError('the selected profile has no enabled address family to update')
     changes = []
-    for version, method, current in ((4, method4, current4), (6, method6, current6)):
+    domain_reports = []
+    for version, method, current, dns in ((4, method4, current4, dns4), (6, method6, current6, dns6)):
         if method in ('disabled', 'ignore') or (version == 6 and ipv4_only):
             continue
         routes = list(map(str, profile_routes(networks, version)))
         installed = {route.strip() for route in current.split(',') if route.strip()}
         if installed != set(routes):
             changes.extend([f'ipv{version}.routes', ','.join(routes)])
+        if search_domains is not None:
+            installed_domains = [domain.strip() for domain in dns.split(',') if domain.strip()]
+            wanted, outside = reconcile_domains(installed_domains, search_domains, sync_domains)
+            if sync_domains and installed_domains != wanted:
+                changes.extend([f'ipv{version}.dns-search', ','.join(wanted)])
+            elif not sync_domains:
+                installed_names = set(installed_domains)
+                additions = [domain for domain in wanted if domain not in installed_names]
+                if additions:
+                    changes.extend([f'+ipv{version}.dns-search', ','.join(additions)])
+            domain_reports.append((f'ipv{version}', outside))
     if changes:
         nmcli('connection', 'modify', 'uuid', profile_uuid, *changes)
+    for family, outside in domain_reports:
+        report_domains(family, outside, sync_domains)
     # Check even on identical snapshots so a failed live reapply can be retried.
     try:
         active = nmcli('--terse', '--fields', 'UUID,DEVICE', 'connection', 'show', '--active')
@@ -265,9 +333,12 @@ def routes_command(argv):
                                      description='Fetch the registered device split-tunnel routes as JSON.')
     parser.add_argument('-w', '--wgconfig', default=REGISTRATION_FILE, help='WARP registration file')
     add_address_family_options(parser)
+    add_domain_options(parser)
     parser.add_argument('--apply', metavar='PROFILE',
-                        help='replace static routes on a dedicated NetworkManager WireGuard profile (name or UUID)')
+                        help='sync static routes and DNS search domains on a dedicated WireGuard profile (name or UUID)')
     args = parser.parse_args(argv)
+    if not args.apply and (args.domainsearch is not None or args.sync_domains):
+        parser.error('DNS profile options require --apply PROFILE')
     try:
         with open(args.wgconfig, encoding='utf-8') as registration:
             if args.apply:
@@ -281,9 +352,8 @@ def routes_command(argv):
             if args.apply:
                 if mode != 'include':
                     raise ValueError('applying static routes requires an Include-mode policy')
-                if domains:
-                    print(f'Policy has {len(domains)} domain rules. Only IP routes will be applied.', file=sys.stderr)
-                apply_routes(args.apply, networks, args.ipv4only)
+                wanted = (args.domainsearch or '').split() + policy_search_domains(domains)
+                apply_routes(args.apply, networks, args.ipv4only, wanted, args.sync_domains)
             else:
                 result = {'mode': mode, 'domains': domains}
                 for key, routes in networks.items():
@@ -354,23 +424,29 @@ def read_json(config_file):
              config_file)
     return config
 
-def get_routes(warpconfig):
-    """Use the same routes for initial profile generation and subsequent syncs."""
+def get_routes_and_domains(warpconfig):
+    """Read the Include policy used to generate a new profile."""
     if warpconfig.get('policy') is None:
-        return ['1.1.1.1/32'], []
-    mode, networks, _ = parse_split_policy(warpconfig['policy'])
+        return ['1.1.1.1/32'], [], []
+    mode, networks, domains = parse_split_policy(warpconfig['policy'])
     if mode != 'include':
         raise ValueError('generating static routes requires an Include-mode policy')
     routes4 = [str(net) for net in profile_routes(networks, 4)]
     routes6 = [str(net) for net in profile_routes(networks, 6)]
-    return routes4, routes6
+    return routes4, routes6, domains
+
+
+def get_routes(warpconfig):
+    """Return the IPv4 and IPv6 route lists from a local WARP configuration."""
+    return get_routes_and_domains(warpconfig)[:2]
 
 def create_nm_config(warpconfig, wgconfig, ifname, nmname, ipv4only, dnssearch):
     '''
     create networkmanager wireguard connection from cloudflare warp config
     '''
     nmconfig = ConfigParser()
-    routes4, routes6 = get_routes(warpconfig)
+    routes4, routes6, hosts = get_routes_and_domains(warpconfig)
+    search_domains, _ = reconcile_domains((dnssearch or '').split(), policy_search_domains(hosts), False)
     nmconfig.add_section('connection')
     nmconfig.add_section('wireguard')
     nmconfig.add_section(f'wireguard-peer.{warpconfig["public_key"]}')
@@ -393,10 +469,10 @@ def create_nm_config(warpconfig, wgconfig, ifname, nmname, ipv4only, dnssearch):
     nmconfig.set('ipv4', 'address1', f'{warpconfig["interface"]["v4"]}/32')
     nmconfig.set('ipv4', 'dns', '1.1.1.1')
     nmconfig.set('ipv4', 'method', 'manual')
-    if dnssearch:
+    if search_domains:
         LOG.info('adding following domains search in ipv4 section: %s',
-                 dnssearch)
-        nmconfig.set('ipv4', 'dns-search', ';'.join(dnssearch.split()) + ';')
+                 ' '.join(search_domains))
+        nmconfig.set('ipv4', 'dns-search', ';'.join(search_domains) + ';')
     for number in range(0, len(routes4)):
         nmconfig.set('ipv4', f'route{number+1}', routes4[number])
     if ipv4only:
@@ -408,56 +484,69 @@ def create_nm_config(warpconfig, wgconfig, ifname, nmname, ipv4only, dnssearch):
         nmconfig.set('ipv6', 'addr-gen-mode', 'eui64')
         nmconfig.set('ipv6', 'address1', f'{warpconfig["interface"]["v6"]}/128')
         nmconfig.set('ipv6', 'dns', '2606:4700:4700::1111')
-        if dnssearch:
+        if search_domains:
             LOG.info('adding following domains search in ipv6 section: %s',
-                     dnssearch)
-            nmconfig.set('ipv6', 'dns-search', ';'.join(dnssearch.split()) + ';')
+                     ' '.join(search_domains))
+            nmconfig.set('ipv6', 'dns-search', ';'.join(search_domains) + ';')
         nmconfig.set('ipv6', 'method', 'manual')
         for number in range(0, len(routes6)):
             nmconfig.set('ipv6', f'route{number+1}', routes6[number])
     return nmconfig
 
-def deploy_nm_config(nmconfig, nmname, nmpath, overwrite, nmreload, dry_run):
-    '''
-    deploy networkmanager configuration
-    '''
-    msg = 'unknown status'
-    write = False
-    if nmpath.endswith('/'):
-        nmpath = nmpath[:-1]
-    config_file = f'{nmpath}/{nmname}.nmconnection'
-    if os.path.isfile(config_file) and not overwrite:
-        msg = 'file exists, skipping write'
-    elif os.path.isfile(config_file) and overwrite:
-        msg = 'file exists, overwriting'
-        write = True
-    elif not os.path.isfile(config_file):
-        msg = 'file does not exists, creating'
-        write = True
-    LOG.info('%s: %s',
-             msg, config_file)
-    if write and dry_run:
-        LOG.info('would have create/overwrite file: %s',
-                 config_file)
-    elif not write and dry_run:
-        LOG.info('would have skip creating/overwriting file: %s',
-                 config_file)
-    elif write and not dry_run:
+def reconcile_keyfile_domains(nmconfig, filename, sync_domains):
+    previous = ConfigParser(interpolation=None, delimiters=('=',), strict=False)
+    try:
+        with open(filename, encoding='utf-8') as source:
+            previous.read_file(source)
+    except (ConfigError, UnicodeError):
+        raise ValueError('could not read DNS search domains from the existing NetworkManager profile') from None
+    reports = []
+    for family in ('ipv4', 'ipv6'):
+        current = previous.get(family, 'dns-search', fallback='').split(';')
+        current = [item.strip() for item in current if item.strip()]
+        if not current:
+            continue
+        if nmconfig[family]['method'] == 'disabled' and not sync_domains:
+            raise ValueError(f'regenerating this profile would disable {family} and drop {family}.dns-search '
+                             f'({", ".join(current)}). Use --dual-stack to keep it or --sync-domains to remove it')
+        desired = nmconfig[family].get('dns-search', '').split(';')
+        wanted, outside = reconcile_domains(current, [item for item in desired if item], sync_domains)
+        if wanted:
+            nmconfig[family]['dns-search'] = ';'.join(wanted) + ';'
+        reports.append((family, outside))
+    return reports
+
+
+def deploy_nm_config(nmconfig, nmname, nmpath, overwrite, nmreload, dry_run, sync_domains=False):
+    config_file = os.path.join(nmpath, f'{nmname}.nmconnection')
+    exists = os.path.isfile(config_file)
+    if exists and not overwrite:
+        LOG.info('file exists, skipping write: %s', config_file)
+        return
+    reports = reconcile_keyfile_domains(nmconfig, config_file, sync_domains) if exists else []
+    if dry_run:
+        LOG.info('would write file: %s', config_file)
+    else:
+        output = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=nmpath, prefix='.unwarp-', delete=False)
         try:
-            with open(config_file, 'w', encoding='utf8') as nmconnfile:
-                nmconfig.write(nmconnfile)
-        except PermissionError as perms_ex:
-            LOG.info('can not write file, insufficient permissions: %s',
-                     config_file)
-            LOG.debug('exception message: %s',
-                      perms_ex)
-            raise IOError from perms_ex
-        LOG.info('setting permissions to 600: %s',
-                 config_file)
-        os.chmod(config_file, 0o600)
-        if nmreload:
-            LOG.info('reloading networkmanager configuration')
-            shell_command('nmcli c reload')
+            with output:
+                nmconfig.write(output)
+                os.fchmod(output.fileno(), 0o600)
+            if overwrite:
+                os.replace(output.name, config_file)
+            else:
+                os.link(output.name, config_file)
+        finally:
+            try:
+                os.unlink(output.name)
+            except FileNotFoundError:
+                pass
+        LOG.info('saved profile with permissions 600: %s', config_file)
+    for family, outside in reports:
+        report_domains(family, outside, sync_domains, dry_run)
+    if nmreload and not dry_run:
+        LOG.info('reloading networkmanager configuration')
+        shell_command('nmcli c reload')
 
 
 def main(argv=None):
@@ -476,6 +565,8 @@ def main(argv=None):
     except IOError:
         return 1
     try:
+        if args.sync_domains and warpconfig.get('policy') is None:
+            raise ValueError('--sync-domains requires a split-tunnel policy')
         nmconfig = create_nm_config(warpconfig, wgconfig, args.interface, args.nmconnectionname, args.ipv4only, args.domainsearch)
     except KeyError as warpconf_ex:
         LOG.error('missing parts in cloudflare warp configuration: %s',
@@ -485,8 +576,10 @@ def main(argv=None):
         LOG.error('%s', policy_error)
         return 1
     try:
-        deploy_nm_config(nmconfig, args.nmconnectionname, args.nmconnectionpath, args.overwrite, args.nmreload, args.dry_run)
-    except IOError:
+        deploy_nm_config(nmconfig, args.nmconnectionname, args.nmconnectionpath, args.overwrite,
+                         args.nmreload, args.dry_run, args.sync_domains)
+    except (OSError, ValueError) as exc:
+        LOG.error('%s', exc)
         return 1
     return 0
 

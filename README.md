@@ -1,6 +1,6 @@
 # Unwarp.py
 
-Generate a NetworkManager WireGuard profile from a Cloudflare WARP configuration and refresh its IP routes from the registered device's split-tunnel policy.
+Generate a NetworkManager WireGuard profile from a Cloudflare WARP configuration and refresh its IP routes and DNS search domains from the registered device's split-tunnel policy.
 
 ## Fetch current routes
 
@@ -18,15 +18,25 @@ Registrations with an `account_id` use the Zero Trust device API. Registrations 
 
 ## Update a WireGuard profile
 
-To fetch and apply the current IP routes to a dedicated unwarp profile, run
+To update IP routes and merge DNS search domains into a dedicated unwarp profile, run
 
 ```sh
 sudo python3 ./unwarp.py routes --apply cloudflare.ztn
 ```
 
-The profile must already exist in NetworkManager. `--apply` accepts its name or UUID. By default it replaces only the profile's static IPv4 routes, including routes added by hand. Add `--dual-stack` to also sync IPv6 routes on an IPv6-enabled profile. Unwarp includes the profile generator's DNS route `1.1.1.1/32`, adds mandatory includes and subtracts mandatory exclusions. Domain rules appear in the preview and require DNS-based routing beyond this IP sync. Exclude-mode policies can be previewed.
+The profile must already exist in NetworkManager. `--apply` accepts its name or UUID. By default it replaces the profile's static IPv4 routes, including routes added by hand, and updates `ipv4.dns-search`. Add `--dual-stack` to update both settings for IPv6 on an IPv6-enabled profile. Unwarp includes the DNS route `1.1.1.1/32`, adds mandatory includes and subtracts mandatory exclusions. Exclude-mode policies can be previewed.
 
-NetworkManager saves the selected route changes together. An active profile is reapplied in place. An inactive profile receives the new routes on its next activation. A fetch error, missing policy or unsupported mode exits nonzero before changing the profile. If NetworkManager saves the profile but fails to reapply it, the command exits nonzero and the next run retries.
+In the default merge mode, existing DNS search domains keep their order and missing policy suffixes are appended. The Include rule `*.corp.example` contributes `corp.example`. A rule for `vpn.corp.example` contributes that full name. Case and a trailing dot are ignored when matching domains. A local routing-only entry such as `~corp.example` keeps its distinct resolver semantics. Search suffixes help resolve short names and select a DNS server with split DNS. Traffic to a resolved address follows the IP routing table. [NetworkManager DNS search domains](https://networkmanager.dev/docs/api/latest/settings-ipv4.html)
+
+To make the selected family's DNS search list match the current policy exactly, run
+
+```sh
+sudo python3 ./unwarp.py routes --apply cloudflare.ztn --sync-domains
+```
+
+Merge mode names local suffixes outside the current policy on stderr and keeps them. Exact sync reports each removed suffix and its address family on stderr after NetworkManager saves the profile. An explicit Include policy with no domain rules clears that family's search list only in exact sync. Use `-s "build.example dev.example"` in merge mode to add extra suffixes.
+
+NetworkManager saves routes and DNS changes together. An active profile is reapplied in place. An inactive profile receives the new settings on its next activation. A fetch error, missing policy or unsupported mode exits nonzero before changing the profile. If NetworkManager saves the profile but fails to reapply it, the command exits nonzero and the next run retries.
 
 For example, a root crontab can refresh a profile every 15 minutes. Substitute the absolute path to your checkout.
 
@@ -36,18 +46,13 @@ For example, a root crontab can refresh a profile every 15 minutes. Substitute t
 
 ## Generate the initial profile from local files
 
-New profiles use IPv4 by default. Add `--dual-stack` when generating a profile to enable both IPv4 and IPv6.
+New profiles use IPv4 and inherit the Include policy's DNS suffixes by default. Add `--dual-stack` when generating a profile to enable both IPv4 and IPv6.
 
+```sh
+sudo python3 ./unwarp.py -r -f -i ztn0 -n cloudflare.ztn
 ```
-# unwarp.py -r -f -i ztn0 -n cloudflare.ztn -s "cloudflare.com google.com microsoft.com"
-INFO    - reading file: /var/lib/cloudflare-warp/conf.json
-INFO    - reading file: /var/lib/cloudflare-warp/reg.json
-INFO    - adding following domains search in ipv4 section: cloudflare.com google.com microsoft.com
-INFO    - disabling ipv6 in networkmanager wireguard connection configuration
-INFO    - file exists, overwriting: /etc/NetworkManager/system-connections/cloudflare.ztn.nmconnection
-INFO    - setting permissions to 600: /etc/NetworkManager/system-connections/cloudflare.ztn.nmconnection
-INFO    - reloading networkmanager configuration
-```
+
+With `-f`, regeneration also merges search domains already in the keyfile. Add `--sync-domains` to mirror the cached policy or `-D` with these flags to preview the removals. If the existing keyfile has IPv6 search domains, use `--dual-stack` to preserve them when regenerating or `--sync-domains` to explicitly drop them when disabling IPv6.
 
 **NOTE**: Script needs root privileges to successfully read Cloudflare WARP configuration and write NetworkManager system connection.
 

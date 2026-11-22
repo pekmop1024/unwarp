@@ -4,6 +4,7 @@ import io
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from configparser import ConfigParser
@@ -105,6 +106,7 @@ class RoutesTest(unittest.TestCase):
             (200, b'<html>test-credential</html>'), (200, {'success': False, 'result': {'policy': POLICY}}),
             (200, {'result': {}}), (200, {'id': PROFILE, 'policy': POLICY}),
             (200, {'policy': {'include': [{'address': 'not a CIDR'}]}}),
+            (200, {'policy': {'include': [{'host': '*'}]}}),
             (200, {'policy': {'include': [], 'exclude': []}}),
             (200, {'policy': {'include': [], 'always_exclude': {}}}),
             (200, {'policy': {'include': POLICY['include'], 'exclude': [{'host': 'example.test'}]}}),
@@ -138,6 +140,82 @@ class RoutesTest(unittest.TestCase):
             self.assertEqual(self.run_command(data, '--apply', 'test'), 1)
             nmcli.assert_not_called()
 
+    def test_dns_suffixes_from_host_rules(self):
+        self.assertEqual(unwarp.policy_search_domains(
+            ['*.CORP.example.', 'corp.example', 'vpn.site.example', 'bücher.example']),
+            ['corp.example', 'vpn.site.example', 'xn--bcher-kva.example'])
+        for invalid in ('*', '.', 'host.*.example', 'a.example,b.example', '~.', 'two words'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                unwarp.policy_search_domains([invalid])
+
+    def test_domain_merge_preserves_search_order_and_routing_only_entries(self):
+        current = ['Local.example', 'corp.EXAMPLE.', '~svc.example']
+        wanted = ['corp.example', 'svc.example', 'corp.example']
+        merged, outside = unwarp.reconcile_domains(current, wanted, False)
+        self.assertEqual(merged, current + ['svc.example'])
+        self.assertEqual(outside, ['Local.example', '~svc.example'])
+        mirrored, removed = unwarp.reconcile_domains(current, wanted, True)
+        self.assertEqual(mirrored, ['corp.example', 'svc.example'])
+        self.assertEqual(removed, outside)
+
+    def test_dns_only_change_reports_removals_after_save(self):
+        properties = [PROFILE, 'wireguard', 'no', 'manual', '1.1.1.1/32', 'manual.test,corp.test',
+                      'disabled', '', '']
+        data = {'policy': {'include': [{'host': '*.corp.test'}, {'host': 'new.test'}]}}
+        with patch('unwarp.nmcli', side_effect=[properties, [], []]) as nmcli:
+            self.assertEqual(self.run_command(data, '--apply', 'test'), 0)
+            self.assertEqual(nmcli.call_args_list[1].args,
+                             ('connection', 'modify', 'uuid', PROFILE, '+ipv4.dns-search', 'new.test'))
+        with patch('unwarp.nmcli', side_effect=[properties, [], []]) as nmcli:
+            self.assertEqual(self.run_command(data, '--apply', 'test', '--sync-domains'), 0)
+            self.assertEqual(nmcli.call_args_list[1].args,
+                             ('connection', 'modify', 'uuid', PROFILE, 'ipv4.dns-search', 'corp.test,new.test'))
+            self.assertEqual(self.stderr.getvalue().strip(), 'Removed from ipv4.dns-search: manual.test')
+        with patch('unwarp.nmcli', side_effect=[properties, ValueError('could not save profile')]):
+            self.assertEqual(self.run_command(data, '--apply', 'test', '--sync-domains'), 1)
+            self.assertNotIn('Removed', self.stderr.getvalue())
+
+    def test_regeneration_merges_by_default_and_reports_explicit_removal(self):
+        directory = self.registration.parent
+        config = directory / 'conf.json'
+        target = directory / 'test.nmconnection'
+        local = {'policy': POLICY, 'public_key': 'test-key', 'endpoints': [{'v4': '192.0.2.1:2408'}],
+                 'interface': {'v4': '192.0.2.2'}}
+        self.registration.write_text(json.dumps({'secret_key': 'synthetic-key'}))
+        config.write_text(json.dumps(local))
+        cli = [sys.executable, '-B', unwarp.__file__, '-w', str(self.registration), '-z', str(config),
+               '-i', 'wg-test', '-n', 'test', '-c', str(directory), '-f']
+        subprocess.run([*cli, '-s', 'manual.test'], check=True, capture_output=True)
+        self.assertIn('dns-search = manual.test;example.test;', target.read_text())
+        local['policy'] = {'include': [{'host': '*.new.test'}]}
+        config.write_text(json.dumps(local))
+        subprocess.run(cli, check=True, capture_output=True)
+        first = target.read_text()
+        self.assertIn('dns-search = manual.test;example.test;new.test;', first)
+        preview = subprocess.run([*cli, '--sync-domains', '-D'], check=True, capture_output=True, text=True)
+        self.assertIn('Would remove from ipv4.dns-search: manual.test, example.test', preview.stderr)
+        self.assertEqual(target.read_text(), first)
+        result = subprocess.run([*cli, '--sync-domains'], check=True, capture_output=True, text=True)
+        self.assertIn('Removed from ipv4.dns-search: manual.test, example.test', result.stderr)
+        self.assertIn('dns-search = new.test;', target.read_text())
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        saved = target.read_text()
+        local.pop('policy')
+        config.write_text(json.dumps(local))
+        missing = subprocess.run([*cli, '--sync-domains'], capture_output=True, text=True)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertEqual(target.read_text(), saved)
+
+    def test_regenerating_ipv4_only_protects_existing_ipv6_domains(self):
+        previous = self.registration.parent / 'test.nmconnection'
+        previous.write_text('[ipv6]\nmethod=manual\ndns-search=v6.test;\n')
+        profile = ConfigParser()
+        profile.read_dict({'ipv4': {'method': 'manual'}, 'ipv6': {'method': 'disabled'}})
+        with self.assertRaisesRegex(ValueError, 'v6.test'):
+            unwarp.reconcile_keyfile_domains(profile, previous, False)
+        self.assertEqual(unwarp.reconcile_keyfile_domains(profile, previous, True), [('ipv6', ['v6.test'])])
+        self.assertNotIn('dns-search', profile['ipv6'])
+
     @unittest.skipUnless(shutil.which('nmcli'), 'NetworkManager CLI is unavailable')
     def test_initial_profile_route_families(self):
         key = 'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE='
@@ -152,12 +230,17 @@ class RoutesTest(unittest.TestCase):
                 profile.write(rendered)
                 saved = subprocess.check_output(['nmcli', '--offline', 'connection', 'modify', 'connection.id', 'test'],
                                                 input=rendered.getvalue(), text=True)
+                parsed = ConfigParser()
+                parsed.read_string(saved)
+                self.assertEqual(parsed['ipv4']['dns-search'], 'example.test;')
                 self.assertIn('192.0.2.128/25', saved)
                 if ipv4_only:
+                    self.assertNotIn('dns-search', parsed['ipv6'])
                     self.assertIn('method=disabled', saved)
                     self.assertNotIn('::/0', saved)
                     self.assertNotIn('2001:db8::/48', saved)
                 else:
+                    self.assertEqual(parsed['ipv6']['dns-search'], 'example.test;')
                     self.assertIn('allowed-ips=0.0.0.0/0;::/0;', saved)
                     self.assertIn('2001:db8::/48', saved)
 
@@ -167,8 +250,9 @@ class RoutesTest(unittest.TestCase):
         initial = subprocess.check_output([*nm, 'add', 'type', 'wireguard', 'ifname', 'wg-test',
                                            'con-name', 'test', 'wireguard.peer-routes', 'no',
                                            'ipv4.method', 'manual', 'ipv4.addresses', '192.0.2.1/32',
-                                           'ipv4.routes', '203.0.113.0/24', 'ipv4.dns-search', 'example.test',
-                                           'ipv6.method', 'manual', 'ipv6.addresses', '2001:db8::1/128'])
+                                           'ipv4.routes', '203.0.113.0/24', 'ipv4.dns-search', 'manual.test,~split.test',
+                                           'ipv6.method', 'manual', 'ipv6.addresses', '2001:db8::1/128',
+                                           'ipv6.dns-search', 'v6.test'])
         profile = initial
         active = False
         reapplied = []
@@ -181,7 +265,11 @@ class RoutesTest(unittest.TestCase):
                 parsed.read_string(profile.decode())
                 def static_routes(family):
                     return ', '.join(value for key, value in parsed[family].items() if key.startswith('route'))
-                return [PROFILE, 'wireguard', 'no', 'manual', static_routes('ipv4'), 'manual', static_routes('ipv6')]
+                properties = [PROFILE, 'wireguard', 'no']
+                for family in ('ipv4', 'ipv6'):
+                    domains = parsed[family].get('dns-search', '').rstrip(';').replace(';', ', ')
+                    properties.extend([parsed[family]['method'], static_routes(family), domains])
+                return properties
             if args[:4] == ('connection', 'modify', 'uuid', PROFILE):
                 writes.append(args[4:])
                 profile = subprocess.check_output([*nm, 'modify', *args[4:]], input=profile)
@@ -202,7 +290,8 @@ class RoutesTest(unittest.TestCase):
             self.assertIn(b'198.51.100.1/32', profile)
             self.assertIn(b'2001:db8::/48', profile)
             self.assertNotIn(b'203.0.113.0/24', profile)
-            self.assertIn(b'dns-search=example.test;', profile)
+            self.assertIn(b'dns-search=manual.test;~split.test;example.test;', profile)
+            self.assertIn(b'dns-search=v6.test;example.test;', profile)
             self.assertEqual(reapplied, [])
             active = True
             first = profile
@@ -218,6 +307,16 @@ class RoutesTest(unittest.TestCase):
             self.assertIn(b'1.1.1.1/32', profile)
             self.assertIn(b'2001:db8::/48', profile)
             self.assertNotIn('ipv6.routes', writes[-1])
+            self.assertIn(b'dns-search=manual.test;~split.test;example.test;', profile)
+            self.assertIn('Keeping local ipv4.dns-search entries outside the policy', self.stderr.getvalue())
+            self.assertEqual(self.run_command(empty, '--apply', 'test', '--sync-domains'), 0)
+            self.assertIn('Removed from ipv4.dns-search: manual.test, ~split.test, example.test', self.stderr.getvalue())
+            self.assertNotIn(b'manual.test', profile)
+            self.assertIn(b'dns-search=v6.test;example.test;', profile)
+            synced = profile
+            self.assertEqual(self.run_command(empty, '--apply', 'test', '--sync-domains'), 0)
+            self.assertEqual(profile, synced)
+            self.assertNotIn('Removed', self.stderr.getvalue())
 
 
 if __name__ == '__main__':
