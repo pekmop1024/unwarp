@@ -1,0 +1,11 @@
+/config/
+*.conf
+*.conf.png
+*.netdev
+*.network
+*.nmconnection
+__pycache__/
+/.venv/
+/build/
+/dist/
+/*.egg-info/

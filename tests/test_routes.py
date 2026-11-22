@@ -12,6 +12,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import unwarp
+from unwarp.backends import networkmanager
+from unwarp.cloudflare import client as cloudflare
+from unwarp.model import ProfileTarget, RouteOptions, policy_search_domains
 
 
 DEVICE = '23acecdf-bddc-4451-b1bf-978461d105e9'
@@ -37,7 +40,7 @@ class RoutesTest(unittest.TestCase):
     def run_command(self, response, *args, status=200):
         self.stdout = io.StringIO()
         self.stderr = io.StringIO()
-        with patch('unwarp.http.client.HTTPSConnection') as self.https:
+        with patch('unwarp.cloudflare.client.http.client.HTTPSConnection') as self.https:
             body = response if isinstance(response, bytes) else json.dumps(response).encode()
             message = io.BytesIO(body)
             message.status = status
@@ -48,7 +51,7 @@ class RoutesTest(unittest.TestCase):
 
     def test_managed_device_preview(self):
         response = {'success': True, 'result': {'id': DEVICE, 'policy': POLICY, 'override_codes': 'private'}}
-        with patch('unwarp.nmcli') as nmcli:
+        with patch('unwarp.backends.networkmanager.nmcli') as nmcli:
             self.assertEqual(self.run_command(response), 0)
             nmcli.assert_not_called()
         self.https.assert_called_once_with('api.devices.cloudflare.com', timeout=15)
@@ -93,7 +96,7 @@ class RoutesTest(unittest.TestCase):
 
     def test_unexpected_id_blocks_apply_without_disclosing_it(self):
         for returned, reason in (('t.' + PROFILE, 'differs'), ('other.' + DEVICE, 'format'), (None, 'format')):
-            with self.subTest(returned=returned), patch('unwarp.nmcli') as nmcli:
+            with self.subTest(returned=returned), patch('unwarp.backends.networkmanager.nmcli') as nmcli:
                 response = {'result': {'id': returned, 'policy': POLICY}}
                 self.assertEqual(self.run_command(response, '--apply', 'test'), 1)
                 nmcli.assert_not_called()
@@ -114,7 +117,7 @@ class RoutesTest(unittest.TestCase):
             (200, {'policy': {'include': POLICY['include'], 'exclude': [{'host': 'example.test'}]}}),
         ]
         for status, response in cases:
-            with self.subTest(status=status, response=response), patch('unwarp.nmcli') as nmcli:
+            with self.subTest(status=status, response=response), patch('unwarp.backends.networkmanager.nmcli') as nmcli:
                 self.assertEqual(self.run_command(response, '--apply', 'test', status=status), 1)
                 nmcli.assert_not_called()
                 self.session.request.assert_called_once()
@@ -139,17 +142,17 @@ class RoutesTest(unittest.TestCase):
         self.assertEqual(self.run_command(data), 0)
         self.assertEqual(json.loads(self.stdout.getvalue())['exclude'], ['198.51.100.2/32'])
         self.assertIsNone(json.loads(self.stdout.getvalue())['dns_search'])
-        with patch('unwarp.nmcli') as nmcli:
+        with patch('unwarp.backends.networkmanager.nmcli') as nmcli:
             self.assertEqual(self.run_command(data, '--apply', 'test'), 1)
             nmcli.assert_not_called()
 
     def test_dns_suffixes_from_host_rules(self):
-        self.assertEqual(unwarp.policy_search_domains(
+        self.assertEqual(policy_search_domains(
             ['*.CORP.example.', 'corp.example', 'vpn.site.example', 'bücher.example']),
             ['corp.example', 'vpn.site.example', 'xn--bcher-kva.example'])
         for invalid in ('*', '.', 'host.*.example', 'a.example,b.example', '~.', 'two words'):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                unwarp.policy_search_domains([invalid])
+                policy_search_domains([invalid])
 
     def test_preview_preserves_unrepresentable_rules(self):
         policy = {'include': [{'host': '*.valid.test'}, {'host': 'host.*.test'}]}
@@ -157,17 +160,17 @@ class RoutesTest(unittest.TestCase):
         preview = json.loads(self.stdout.getvalue())
         self.assertEqual(preview['domains'], ['*.valid.test', 'host.*.test'])
         self.assertIsNone(preview['dns_search'])
-        with patch('unwarp.nmcli') as nmcli:
+        with patch('unwarp.backends.networkmanager.nmcli') as nmcli:
             self.assertEqual(self.run_command({'policy': policy}, '--apply', 'test'), 1)
             nmcli.assert_not_called()
 
     def test_domain_merge_preserves_search_order_and_routing_only_entries(self):
         current = ['Local.example', 'corp.EXAMPLE.', '~svc.example']
         wanted = ['corp.example', 'svc.example', 'corp.example']
-        merged, outside = unwarp.reconcile_domains(current, wanted, False)
+        merged, outside = networkmanager.reconcile_domains(current, wanted, False)
         self.assertEqual(merged, current + ['svc.example'])
         self.assertEqual(outside, ['Local.example', '~svc.example'])
-        mirrored, removed = unwarp.reconcile_domains(current, wanted, True)
+        mirrored, removed = networkmanager.reconcile_domains(current, wanted, True)
         self.assertEqual(mirrored, ['corp.example', 'svc.example'])
         self.assertEqual(removed, outside)
 
@@ -175,16 +178,16 @@ class RoutesTest(unittest.TestCase):
         properties = [PROFILE, 'wireguard', 'no', 'manual', '1.1.1.1/32', 'manual.test,corp.test',
                       'disabled', '', '']
         data = {'policy': {'include': [{'host': '*.corp.test'}, {'host': 'new.test'}]}}
-        with patch('unwarp.nmcli', side_effect=[properties, [], []]) as nmcli:
+        with patch('unwarp.backends.networkmanager.nmcli', side_effect=[properties, [], []]) as nmcli:
             self.assertEqual(self.run_command(data, '--apply', 'test'), 0)
             self.assertEqual(nmcli.call_args_list[1].args,
                              ('connection', 'modify', 'uuid', PROFILE, '+ipv4.dns-search', 'new.test'))
-        with patch('unwarp.nmcli', side_effect=[properties, [], []]) as nmcli:
+        with patch('unwarp.backends.networkmanager.nmcli', side_effect=[properties, [], []]) as nmcli:
             self.assertEqual(self.run_command(data, '--apply', 'test', '--sync-domains'), 0)
             self.assertEqual(nmcli.call_args_list[1].args,
                              ('connection', 'modify', 'uuid', PROFILE, 'ipv4.dns-search', 'corp.test,new.test'))
             self.assertEqual(self.stderr.getvalue().strip(), 'Removed from ipv4.dns-search: manual.test')
-        with patch('unwarp.nmcli', side_effect=[properties, ValueError('could not save profile')]):
+        with patch('unwarp.backends.networkmanager.nmcli', side_effect=[properties, ValueError('could not save profile')]):
             self.assertEqual(self.run_command(data, '--apply', 'test', '--sync-domains'), 1)
             self.assertNotIn('Removed', self.stderr.getvalue())
 
@@ -192,13 +195,13 @@ class RoutesTest(unittest.TestCase):
         properties = [PROFILE, 'wireguard', 'no', 'manual', '1.1.1.1/32',
                       '*.corp.test,*.old.test,legacy.*.test', 'disabled', '', '']
         data = {'policy': {'include': [{'host': '*.corp.test'}]}}
-        with patch('unwarp.nmcli', side_effect=[properties, [], []]) as nmcli:
+        with patch('unwarp.backends.networkmanager.nmcli', side_effect=[properties, [], []]) as nmcli:
             self.assertEqual(self.run_command(data, '--apply', 'test', '--sync-domains'), 0)
             self.assertEqual(nmcli.call_args_list[1].args,
                              ('connection', 'modify', 'uuid', PROFILE, 'ipv4.dns-search', 'corp.test'))
             self.assertIn('Normalized ipv4.dns-search: *.corp.test -> corp.test', self.stderr.getvalue())
             self.assertIn('Removed from ipv4.dns-search: *.old.test, legacy.*.test', self.stderr.getvalue())
-        with patch('unwarp.nmcli', side_effect=[properties, ValueError('could not save profile')]):
+        with patch('unwarp.backends.networkmanager.nmcli', side_effect=[properties, ValueError('could not save profile')]):
             self.assertEqual(self.run_command(data, '--apply', 'test', '--sync-domains'), 1)
             self.assertNotIn('Normalized', self.stderr.getvalue())
             self.assertNotIn('Removed', self.stderr.getvalue())
@@ -211,7 +214,8 @@ class RoutesTest(unittest.TestCase):
                  'interface': {'v4': '192.0.2.2'}}
         self.registration.write_text(json.dumps({'secret_key': 'synthetic-key'}))
         config.write_text(json.dumps(local))
-        cli = [sys.executable, '-B', unwarp.__file__, '-w', str(self.registration), '-z', str(config),
+        launcher = Path(__file__).resolve().parents[1] / 'unwarp.py'
+        cli = [sys.executable, '-B', str(launcher), '-w', str(self.registration), '-z', str(config),
                '-i', 'wg-test', '-n', 'test', '-c', str(directory), '-f']
         subprocess.run([*cli, '-s', '*.manual.test *.example.test'], check=True, capture_output=True)
         self.assertIn('dns-search = manual.test;example.test;', target.read_text())
@@ -242,8 +246,8 @@ class RoutesTest(unittest.TestCase):
         profile = ConfigParser()
         profile.read_dict({'ipv4': {'method': 'manual'}, 'ipv6': {'method': 'disabled'}})
         with self.assertRaisesRegex(ValueError, 'v6.test'):
-            unwarp.reconcile_keyfile_domains(profile, previous, False)
-        self.assertEqual(unwarp.reconcile_keyfile_domains(profile, previous, True), [('ipv6', ['v6.test'], [])])
+            networkmanager.reconcile_keyfile_domains(profile, previous, False)
+        self.assertEqual(networkmanager.reconcile_keyfile_domains(profile, previous, True), [('ipv6', ['v6.test'], [])])
         self.assertNotIn('dns-search', profile['ipv6'])
 
     @unittest.skipUnless(shutil.which('nmcli'), 'NetworkManager CLI is unavailable')
@@ -254,8 +258,9 @@ class RoutesTest(unittest.TestCase):
         for flags, ipv4_only in (([], True), (['--ipv4only'], True), (['--dual-stack'], False)):
             with self.subTest(flags=flags):
                 args = unwarp.parse_args(['-i', 'wg-test', '-n', 'test', *flags])
-                profile = unwarp.create_nm_config(config, {'secret_key': key}, args.interface,
-                                                  args.nmconnectionname, args.ipv4only, None)
+                tunnel = cloudflare.cached_tunnel(config, {'secret_key': key}, args.ipv4only)
+                profile = networkmanager.render_profile(ProfileTarget(args.interface, args.profile_name),
+                                                        tunnel, RouteOptions(ipv4_only=args.ipv4only))
                 rendered = io.StringIO()
                 profile.write(rendered)
                 saved = subprocess.check_output(['nmcli', '--offline', 'connection', 'modify', 'connection.id', 'test'],
@@ -278,7 +283,7 @@ class RoutesTest(unittest.TestCase):
     def test_apply_replaces_routes_in_a_real_offline_nm_profile(self):
         nm = ['nmcli', '--offline', 'connection']
         initial = subprocess.check_output([*nm, 'add', 'type', 'wireguard', 'ifname', 'wg-test',
-                                           'con-name', 'test', 'wireguard.peer-routes', 'no',
+                                           'con-name', 'test', 'wireguard.peer-routes', 'no', 'wireguard.mtu', '1400',
                                            'ipv4.method', 'manual', 'ipv4.addresses', '192.0.2.1/32',
                                            'ipv4.routes', '203.0.113.0/24', 'ipv4.dns-search', '*.manual.test,~*.split.test',
                                            'ipv6.method', 'manual', 'ipv6.addresses', '2001:db8::1/128',
@@ -313,7 +318,7 @@ class RoutesTest(unittest.TestCase):
                 return []
             self.fail(args)
 
-        with patch('unwarp.nmcli', side_effect=nmcli):
+        with patch('unwarp.backends.networkmanager.nmcli', side_effect=nmcli):
             data = {'policy': POLICY}
             self.assertEqual(self.run_command(data, '--dual-stack', '--apply', 'test', '-s', '*.example.test'), 0)
             self.assertIn(b'192.0.2.128/25', profile)
@@ -348,6 +353,7 @@ class RoutesTest(unittest.TestCase):
             synced = profile
             self.assertEqual(self.run_command(empty, '--apply', 'test', '--sync-domains'), 0)
             self.assertEqual(profile, synced)
+            self.assertIn(b'mtu=1400\n', profile)
             self.assertNotIn('Removed', self.stderr.getvalue())
 
 
