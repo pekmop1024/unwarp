@@ -224,44 +224,72 @@ def profile_routes(networks, version):
     return sorted(routes)
 
 
+def dns_suffix(host):
+    """Translate an exact host or one leading wildcard label to a DNS suffix."""
+    name = host.strip()
+    if name.startswith('*.'):
+        name = name[2:]
+    if name.endswith('.'):
+        name = name[:-1]
+    try:
+        name = name.encode('idna').decode('ascii').lower()
+    except UnicodeError:
+        raise ValueError('invalid DNS name') from None
+    if len(name) > 253 or not all(re.fullmatch(r'[a-z0-9_-]{1,63}', label) for label in name.split('.')):
+        raise ValueError('expected a DNS name or *.domain')
+    return name
+
+
 def policy_search_domains(hosts):
-    """Convert Include host rules to the DNS suffixes accepted by NetworkManager."""
-    domains = set()
-    for host in hosts:
-        name = host.strip()
-        if name.startswith('*.'):
-            name = name[2:]
-        if name.endswith('.'):
-            name = name[:-1]
+    return sorted({dns_suffix(host) for host in hosts})
+
+
+def nm_search_domain(domain):
+    """Keep local suffix spelling and routing-only semantics when converting a wildcard."""
+    if '*' not in domain:
+        return domain
+    if domain.startswith('~'):
+        return '~' + dns_suffix(domain[1:])
+    return dns_suffix(domain)
+
+
+def plan_dns_domains(current, wanted, sync):
+    desired = {}
+    for raw in wanted:
+        domain = nm_search_domain(raw)
+        desired.setdefault(domain.lower().rstrip('.'), domain)
+
+    existing, outside, rewrites = {}, [], []
+    for raw in current:
         try:
-            name = name.encode('idna').decode('ascii').lower()
-        except UnicodeError:
-            raise ValueError('invalid DNS name in the Include policy') from None
-        labels = name.split('.')
-        if len(name) > 253 or not all(re.fullmatch(r'[a-z0-9_-]{1,63}', label) for label in labels):
-            raise ValueError('expected a DNS name or *.domain in the Include policy')
-        domains.add(name)
-    return sorted(domains)
+            domain = nm_search_domain(raw)
+        except ValueError:
+            # A legacy pattern with no suffix equivalent stays local until exact sync removes it.
+            domain = raw
+        name = domain.lower().rstrip('.')
+        existing.setdefault(name, domain)
+        if name not in desired:
+            outside.append(raw if sync else existing[name])
+        if domain != raw and (not sync or name in desired):
+            rewrites.append((raw, desired[name] if sync else existing[name]))
+
+    if not sync:
+        for name, domain in desired.items():
+            existing.setdefault(name, domain)
+    result = desired if sync else existing
+    return list(result.values()), list(dict.fromkeys(outside)), rewrites
 
 
 def reconcile_domains(current, wanted, sync):
-    """Keep search order in merge mode. Return local suffixes outside the desired list."""
-    def by_name(values):
-        names = {}
-        for domain in values:
-            names.setdefault(domain.lower().rstrip('.'), domain)
-        return names
-
-    existing, desired = by_name(current), by_name(wanted)
-    outside = [domain for name, domain in existing.items() if name not in desired]
-    if sync:
-        return list(desired.values()), outside
-    for name, domain in desired.items():
-        existing.setdefault(name, domain)
-    return list(existing.values()), outside
+    """Return the search list and the local suffixes outside the desired list."""
+    return plan_dns_domains(current, wanted, sync)[:2]
 
 
-def report_domains(family, outside, sync, dry_run=False):
+def report_domains(family, outside, sync, dry_run=False, rewrites=()):
+    if rewrites:
+        action = 'Would normalize' if dry_run else 'Normalized'
+        changes = ', '.join(f'{raw} -> {suffix}' for raw, suffix in rewrites)
+        print(f'{action} {family}.dns-search: {changes}', file=sys.stderr)
     if outside:
         if sync:
             action = 'Would remove' if dry_run else 'Removed'
@@ -304,19 +332,20 @@ def apply_routes(profile, networks, ipv4_only, search_domains=None, sync_domains
             changes.extend([f'ipv{version}.routes', ','.join(routes)])
         if search_domains is not None:
             installed_domains = [domain.strip() for domain in dns.split(',') if domain.strip()]
-            wanted, outside = reconcile_domains(installed_domains, search_domains, sync_domains)
-            if sync_domains and installed_domains != wanted:
+            wanted, outside, rewrites = plan_dns_domains(installed_domains, search_domains, sync_domains)
+            if (sync_domains or rewrites) and installed_domains != wanted:
+                # A legacy wildcard is replaced in place, preserving DNS search order.
                 changes.extend([f'ipv{version}.dns-search', ','.join(wanted)])
             elif not sync_domains:
                 installed_names = set(installed_domains)
                 additions = [domain for domain in wanted if domain not in installed_names]
                 if additions:
                     changes.extend([f'+ipv{version}.dns-search', ','.join(additions)])
-            domain_reports.append((f'ipv{version}', outside))
+            domain_reports.append((f'ipv{version}', outside, rewrites))
     if changes:
         nmcli('connection', 'modify', 'uuid', profile_uuid, *changes)
-    for family, outside in domain_reports:
-        report_domains(family, outside, sync_domains)
+    for family, outside, rewrites in domain_reports:
+        report_domains(family, outside, sync_domains, rewrites=rewrites)
     # Check even on identical snapshots so a failed live reapply can be retried.
     try:
         active = nmcli('--terse', '--fields', 'UUID,DEVICE', 'connection', 'show', '--active')
@@ -355,7 +384,13 @@ def routes_command(argv):
                 wanted = (args.domainsearch or '').split() + policy_search_domains(domains)
                 apply_routes(args.apply, networks, args.ipv4only, wanted, args.sync_domains)
             else:
-                result = {'mode': mode, 'domains': domains}
+                result = {'mode': mode, 'domains': domains, 'dns_search': None}
+                if mode == 'include':
+                    try:
+                        result['dns_search'] = policy_search_domains(domains)
+                    except ValueError:
+                        # Keep the original rules available for inspection if they cannot all be applied.
+                        pass
                 for key, routes in networks.items():
                     result[key] = [str(net) for net in routes if not args.ipv4only or net.version == 4]
                 print(json.dumps(result))
@@ -446,7 +481,8 @@ def create_nm_config(warpconfig, wgconfig, ifname, nmname, ipv4only, dnssearch):
     '''
     nmconfig = ConfigParser()
     routes4, routes6, hosts = get_routes_and_domains(warpconfig)
-    search_domains, _ = reconcile_domains((dnssearch or '').split(), policy_search_domains(hosts), False)
+    wanted = (dnssearch or '').split() + policy_search_domains(hosts)
+    search_domains, _ = reconcile_domains([], wanted, False)
     nmconfig.add_section('connection')
     nmconfig.add_section('wireguard')
     nmconfig.add_section(f'wireguard-peer.{warpconfig["public_key"]}')
@@ -510,10 +546,10 @@ def reconcile_keyfile_domains(nmconfig, filename, sync_domains):
             raise ValueError(f'regenerating this profile would disable {family} and drop {family}.dns-search '
                              f'({", ".join(current)}). Use --dual-stack to keep it or --sync-domains to remove it')
         desired = nmconfig[family].get('dns-search', '').split(';')
-        wanted, outside = reconcile_domains(current, [item for item in desired if item], sync_domains)
+        wanted, outside, rewrites = plan_dns_domains(current, [item for item in desired if item], sync_domains)
         if wanted:
             nmconfig[family]['dns-search'] = ';'.join(wanted) + ';'
-        reports.append((family, outside))
+        reports.append((family, outside, rewrites))
     return reports
 
 
@@ -542,8 +578,8 @@ def deploy_nm_config(nmconfig, nmname, nmpath, overwrite, nmreload, dry_run, syn
             except FileNotFoundError:
                 pass
         LOG.info('saved profile with permissions 600: %s', config_file)
-    for family, outside in reports:
-        report_domains(family, outside, sync_domains, dry_run)
+    for family, outside, rewrites in reports:
+        report_domains(family, outside, sync_domains, dry_run, rewrites)
     if nmreload and not dry_run:
         LOG.info('reloading networkmanager configuration')
         shell_command('nmcli c reload')
