@@ -79,17 +79,27 @@ def parse_args(argv=None):
     return args
 
 
+def split_registration_id(value):
+    """Return the wire prefix and UUID of a WARP registration ID."""
+    if not isinstance(value, str):
+        raise ValueError('registration ID must be a string')
+    if value.startswith('t.'):
+        return 't.', uuid.UUID(value[2:])
+    return '', uuid.UUID(value)
+
+
 def fetch_device_policy(registration):
     """Read the split-tunnel policy for this registration from Cloudflare."""
     if not isinstance(registration, dict):
         raise ValueError('expected an object in the WARP registration file')
-    device_id = registration.get('registration_id')
-    if isinstance(device_id, list) and device_id:
-        device_id = device_id[0]
+    stored_id = registration.get('registration_id')
+    if isinstance(stored_id, list) and stored_id:
+        stored_id = stored_id[0]
     try:
-        device_id = str(uuid.UUID(str(device_id)))
+        prefix, expected_uuid = split_registration_id(stored_id)
     except ValueError:
         raise ValueError('reg.json is missing a valid registration_id') from None
+    device_id = f'{prefix}{expected_uuid}'
     token = registration.get('api_token')
     if not isinstance(token, str) or not re.fullmatch(r'[!-~]+', token):
         raise ValueError('reg.json is missing a valid api_token')
@@ -131,8 +141,14 @@ def fetch_device_policy(registration):
         raise ValueError('the registration response contains no split-tunnel policy')
     if device.get('enabled') is False:
         raise ValueError('Cloudflare reports this registration is disabled')
-    if 'id' in device and str(device['id']).lower() != device_id:
-        raise ValueError('the response belongs to a different registration')
+    if 'id' in device:
+        try:
+            _, returned_uuid = split_registration_id(device['id'])
+        except ValueError:
+            raise ValueError('unrecognized registration ID format in the device API response '
+                             '(expected UUID or t.<UUID>)') from None
+        if returned_uuid != expected_uuid:
+            raise ValueError('the registration UUID in the device API response differs from reg.json')
     return device['policy']
 
 

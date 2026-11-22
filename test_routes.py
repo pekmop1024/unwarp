@@ -66,6 +66,31 @@ class RoutesTest(unittest.TestCase):
         self.assertEqual(self.session.request.call_args.args, ('GET', f'/v0a5641/reg/{DEVICE}'))
         self.assertEqual(json.loads(self.stdout.getvalue())['include'], ['192.0.2.0/24'])
 
+    def test_registration_id_wire_formats(self):
+        compact = DEVICE.replace('-', '').upper()
+        for local, returned, requested in (
+            ([DEVICE, None], 't.' + DEVICE, DEVICE),
+            (DEVICE, compact, DEVICE),
+            ('t.' + compact, DEVICE, 't.' + DEVICE),
+        ):
+            with self.subTest(local=local, returned=returned):
+                self.registration.write_text(json.dumps({**REGISTRATION, 'registration_id': local}))
+                response = {'result': {'id': returned, 'policy': POLICY}}
+                self.assertEqual(self.run_command(response), 0, self.stderr.getvalue())
+                self.assertEqual(json.loads(self.stdout.getvalue())['mode'], 'include')
+                self.assertEqual(self.session.request.call_args.args, ('GET', f'/v1/accounts/{ACCOUNT}/reg/{requested}'))
+
+    def test_unexpected_id_blocks_apply_without_disclosing_it(self):
+        for returned, reason in (('t.' + PROFILE, 'differs'), ('other.' + DEVICE, 'format'), (None, 'format')):
+            with self.subTest(returned=returned), patch('unwarp.nmcli') as nmcli:
+                response = {'result': {'id': returned, 'policy': POLICY}}
+                self.assertEqual(self.run_command(response, '--apply', 'test'), 1)
+                nmcli.assert_not_called()
+                self.assertEqual(self.stdout.getvalue(), '')
+                self.assertIn(reason, self.stderr.getvalue())
+                self.assertNotIn(DEVICE, self.stderr.getvalue())
+                self.assertNotIn(PROFILE, self.stderr.getvalue())
+
     def test_fetch_failures_never_modify_a_profile_or_print_secrets(self):
         cases = [
             (302, b'test-credential'), (401, b'test-credential'), (403, b'test-credential'),
