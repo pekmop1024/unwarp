@@ -225,3 +225,7 @@ Thanks to the teams whose documentation and code guided unwarp's device enrollme
 The **OpenAI Codex CLI** inspired the sign-in prompt that lets the user open a link and return to the terminal after signing in. [Codex browser login](https://github.com/openai/codex/blob/main/codex-rs/login/src/server.rs)
 
 Unwarp uses **Mozilla Firefox** protocol handlers to return the browser callback to the local process. Thanks to the **wireguard-tools** contributors for the reference implementation we use to check key compatibility. [Firefox protocol handlers](https://firefox-admin-docs.mozilla.org/reference/policies/handlers/) · [WireGuard key generation](https://www.wireguard.com/quickstart/#key-generation)
+
+## License
+
+Unwarp is licensed under the [GNU General Public License, version 3 only](LICENSE).
