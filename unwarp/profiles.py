@@ -19,10 +19,17 @@ from .model import ProfileTarget, connection_name, interface_name
 SYSTEM_INTERFACES = Path('/sys/class/net')
 
 
-def default_config_dir() -> Path:
-    """Keep source checkouts portable and installed credentials per user."""
+def checkout_root() -> Path | None:
     root = Path(__file__).resolve().parents[1]
     if (root / 'unwarp.py').is_file() and (root / 'pyproject.toml').is_file():
+        return root
+    return None
+
+
+def default_config_dir() -> Path:
+    """Keep source checkouts portable and installed credentials per user."""
+    root = checkout_root()
+    if root is not None:
         return root / 'config'
     xdg_config = Path(os.environ.get('XDG_CONFIG_HOME', ''))
     if xdg_config.is_absolute():
@@ -102,7 +109,7 @@ def save_config(path, data, directory_fd):
             Path(output.name).unlink(missing_ok=True)
 
 
-def enroll(args):
+def enroll(args, *, browser_options=None):
     team = args.team.lower()
     url = enrollment_url(team, args.login_url)
     directory = Path(args.config_dir)
@@ -127,7 +134,7 @@ def enroll(args):
                 if not data.get('api_token') or not data.get('registration_id'):
                     raise ValueError('the saved interface config is missing the Cloudflare registration')
                 print(f'{interface} is already registered. Config: {path}')
-                return
+                return interface, data.get('backend', DEFAULT_BACKEND)
             if data['state'] == 'submitting' and not args.retry_uncertain:
                 raise ValueError('the previous request may have registered this device; check Zero Trust '
                                  'before using --retry-uncertain with this interface')
@@ -138,7 +145,7 @@ def enroll(args):
             save_config(path, data, fd)
         print(f'Enrolling interface {interface}. Config: {path}', flush=True)
         public_key = derive_public_key(data['secret_key'])
-        assertion, account = sign_in(team, url, args.manual)
+        assertion, account = sign_in(team, url, args.manual, browser_options=browser_options)
         data['state'] = 'submitting'
         save_config(path, data, fd)
         try:
@@ -154,3 +161,4 @@ def enroll(args):
                     public_key=public_key)
         save_config(path, data, fd)
     print(f'Registered {interface}. Profile: {data["connection_name"]}')
+    return interface, data.get('backend', DEFAULT_BACKEND)

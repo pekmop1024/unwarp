@@ -5,6 +5,9 @@ import fcntl
 import http.client
 import json
 import logging
+import os
+import pwd
+import shlex
 import subprocess
 import sys
 from dataclasses import replace
@@ -13,7 +16,8 @@ from pathlib import Path
 from .backends import BACKENDS, DEFAULT_BACKEND, get_backend
 from .cloudflare import client as cloudflare
 from .model import DEFAULT_MTU, ProfileTarget, RouteOptions, WriteOptions
-from .profiles import choose_interface, config_path, default_config_dir, enroll, load_config, saved_target
+from .profiles import (checkout_root, choose_interface, config_path, default_config_dir, enroll,
+                       load_config, saved_target)
 
 
 def add_address_family_options(parser):
@@ -64,8 +68,8 @@ def parse_args(argv=None):
                         help=f'configuration backend (default for new profiles: {DEFAULT_BACKEND})')
     add_config_directory(shared)
     options, remaining = shared.parse_known_args(argv)
-    descriptions = {'enroll': 'Enroll an interface using your team sign-in.',
-                    'profile': 'Write the profile for an enrolled interface.',
+    descriptions = {'enroll': 'Sign in from your desktop session and save the interface registration.',
+                    'profile': 'Write the profile using the saved registration for an interface.',
                     'routes': 'Preview the device policy or update a profile.'}
     command = remaining.pop(0) if remaining and remaining[0] in descriptions else None
     prog = 'unwarp.py' if Path(sys.argv[0]).name == 'unwarp.py' else 'unwarp'
@@ -158,13 +162,95 @@ def routes_command(args):
         backend.apply_routes(target, cloudflare.fetch_policy(data), routes)
 
 
-def profile_command(args):
+def launcher():
+    checkout = checkout_root()
+    if checkout is not None:
+        return [sys.executable, str(checkout / 'unwarp.py')]
+    return [sys.executable, '-I', '-m', 'unwarp']
+
+
+def nm_install_command(directory, arguments):
+    # sudo may change HOME, XDG_CONFIG_HOME and PATH. Pin the registration and the launcher.
+    config_option = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    config_option.add_argument('--config-dir')
+    _, arguments = config_option.parse_known_args(arguments)
+    prefix = ['sudo'] if os.geteuid() != 0 or sudo_uid() is not None else []
+    return shlex.join([*prefix, *launcher(), '--config-dir', str(directory.absolute()), *arguments])
+
+
+def sudo_uid():
+    value = os.environ.get('SUDO_UID', '')
+    return (int(value) or None) if os.geteuid() == 0 and value.isdecimal() else None
+
+
+def desktop_process_options(uid):
+    user = pwd.getpwuid(uid)
+    session = {'DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS',
+               'XDG_CONFIG_HOME', 'XDG_SESSION_TYPE', 'PATH', 'TERM', 'LANG', 'LANGUAGE'}
+    env = {key: value for key, value in os.environ.items() if key in session or key.startswith('LC_')}
+    env.update(HOME=user.pw_dir, USER=user.pw_name, LOGNAME=user.pw_name)
+    runtime = Path('/run/user') / str(uid)
+    if runtime.is_dir() and env.get('XDG_RUNTIME_DIR') in (None, '', '/run/user/0'):
+        env['XDG_RUNTIME_DIR'] = str(runtime)
+    if (not (env.get('DISPLAY') or env.get('WAYLAND_DISPLAY') or os.environ.get('SSH_CONNECTION'))
+            and env.get('XDG_RUNTIME_DIR')):
+        runtime = Path(env['XDG_RUNTIME_DIR'])
+        if runtime.is_absolute() and runtime.is_dir() and runtime.stat().st_uid == uid:
+            displays = [path.name for path in runtime.glob('wayland-*') if path.is_socket()]
+            if len(displays) == 1:
+                env['WAYLAND_DISPLAY'] = displays[0]
+    return dict(user=uid, group=user.pw_gid, extra_groups=os.getgrouplist(user.pw_name, user.pw_gid), env=env)
+
+
+def root_registration_directory(directory, arguments):
+    try:
+        return directory.stat().st_uid == 0
+    except FileNotFoundError:
+        explicit = any(arg.partition('=')[0] == '--config-dir' for arg in arguments)
+        if not explicit and checkout_root() is None and directory == default_config_dir():
+            return False  # Resolve a fresh default again in the enrolling user's environment.
+    for parent in directory.absolute().parents:
+        try:
+            info = parent.stat()
+        except FileNotFoundError:
+            continue
+        return info.st_uid == 0 and not info.st_mode & 0o022
+    return False
+
+
+def enroll_command(args, arguments):
+    uid = sudo_uid()
+    browser_options = None
+    if uid is not None and not args.manual and sys.stdin.isatty():
+        desktop = desktop_process_options(uid)
+        print('Running browser sign-in as your desktop user.', file=sys.stderr, flush=True)
+        if not root_registration_directory(args.config_dir, arguments):
+            return subprocess.run([*launcher(), *arguments], **desktop).returncode
+        # An earlier sudo run may already own the registration and its private key.
+        browser_options = desktop
+    interface, backend = enroll(args, browser_options=browser_options)
+    if backend == 'networkmanager':
+        command = nm_install_command(args.config_dir, ['profile', f'--interface={interface}', '--reload'])
+        print(f'Install the NetworkManager system connection using this registration:\n  {command}')
+    return 0
+
+
+def profile_command(args, arguments):
     with config_path(args.config_dir, args.interface).open(encoding='utf-8') as file:
         lock_profile_update(file)
         data = load_config(file, args.interface)
-        backend = profile_backend(args.backend or data.get('backend', DEFAULT_BACKEND), args)
+        name = args.backend or data.get('backend', DEFAULT_BACKEND)
+        backend = profile_backend(name, args)
         tunnel = cloudflare.fetch_tunnel(data, args.ipv4only)
-        write_profile(backend, saved_target(data), tunnel, args)
+        try:
+            write_profile(backend, saved_target(data), tunnel, args)
+        except PermissionError:
+            if (name != 'networkmanager' or os.geteuid() == 0
+                    or (args.output_dir or backend.DEFAULT_DIRECTORY).absolute() != backend.DEFAULT_DIRECTORY):
+                raise
+            command = nm_install_command(args.config_dir, arguments)
+            raise ValueError(f'Access to {backend.DEFAULT_DIRECTORY} requires administrator privileges. '
+                             f'Use this registration and the same profile options:\n  {command}') from None
 
 
 def import_command(args):
@@ -184,16 +270,17 @@ def configure_logging(debug, dry_run):
 
 
 def main(argv=None):
-    args = parse_args(argv)
+    arguments = sys.argv[1:] if argv is None else list(argv)
+    args = parse_args(arguments)
     if args.command in (None, 'profile'):
         configure_logging(getattr(args, 'debug', False), args.dry_run)
     try:
         if args.command == 'routes':
             routes_command(args)
         elif args.command == 'enroll':
-            enroll(args)
+            return enroll_command(args, arguments)
         elif args.command == 'profile':
-            profile_command(args)
+            profile_command(args, arguments)
         else:
             import_command(args)
     except (OSError, ValueError, KeyError, EOFError, http.client.HTTPException, subprocess.TimeoutExpired) as exc:

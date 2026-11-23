@@ -3,8 +3,11 @@ import http.client
 import io
 import json
 import os
+import shlex
 import shutil
+import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -13,7 +16,7 @@ from unittest.mock import MagicMock, patch
 from urllib.parse import urlsplit
 
 import unwarp
-from unwarp import profiles
+from unwarp import cli, profiles
 from unwarp.backends import networkmanager
 from unwarp.cloudflare import client as cloudflare, login
 
@@ -135,6 +138,99 @@ class EnrollmentTest(unittest.TestCase):
         for secret in (DEVICE_TOKEN, PRIVATE, '.signature'):
             self.assertNotIn(secret, self.output.getvalue() + self.errors.getvalue())
 
+    def test_enrollment_prints_reusable_system_profile_command(self):
+        self.directory = self.root / "user's registrations"
+        self.assertEqual(self.enroll('-i', 'office'), 0, self.errors.getvalue())
+        self.assertEqual(self.enroll('-i', 'office'), 0, self.errors.getvalue())
+        commands = [shlex.split(line) for line in self.output.getvalue().splitlines() if line.startswith('  ')]
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[0], commands[1])
+        command = commands[0]
+        if os.geteuid() != 0:
+            self.assertEqual(command[0], 'sudo')
+        if command[0] == 'sudo':
+            command.pop(0)
+        launcher = [sys.executable, str(Path(__file__).resolve().parents[1] / 'unwarp.py')]
+        self.assertEqual(command[:2], launcher)
+        args = unwarp.parse_args(command[2:])
+        self.assertEqual((args.command, args.config_dir, args.interface, args.reload),
+                         ('profile', self.directory, 'office', True))
+        self.assertEqual(self.connection.request.call_count, 1)
+        self.connection.getresponse.return_value = reply({'result': LIVE})
+        with contextlib.redirect_stdout(self.output), patch('unwarp.cli.configure_logging'):
+            self.assertEqual(unwarp.main(command[2:]), 0)
+        self.assertTrue((self.keyfiles / 'office.nmconnection').is_file())
+
+    def test_interactive_sudo_enrolls_as_the_invoking_desktop_user(self):
+        stdin = MagicMock()
+        stdin.isatty.return_value = True
+        args = ['enroll', TEAM, '-i', 'office']
+        with (patch('os.geteuid', return_value=0),
+              patch.dict(os.environ, SUDO_UID='1234', HOME='/root', DISPLAY=':test', ADMIN_ONLY='secret'),
+              patch('sys.stdin', stdin), contextlib.redirect_stderr(self.errors),
+              patch('unwarp.cli.checkout_root', return_value=None),
+              patch('unwarp.cli.default_config_dir', return_value=self.directory),
+              patch('unwarp.cli.pwd.getpwuid') as account, patch('os.getgrouplist', return_value=[345, 456]),
+              patch('unwarp.cli.subprocess.run') as child):
+            account.return_value = MagicMock(pw_dir='/home/desktop', pw_name='desktop', pw_gid=345)
+            child.return_value.returncode = 23
+            self.assertEqual(unwarp.main(args), 23)
+        account.assert_called_once_with(1234)
+        argv, = child.call_args.args
+        self.assertEqual(argv, [sys.executable, '-I', '-m', 'unwarp', *args])
+        opts = child.call_args.kwargs
+        self.assertEqual((opts['user'], opts['group'], opts['extra_groups']), (1234, 345, [345, 456]))
+        self.assertEqual((opts['env']['HOME'], opts['env']['USER'], opts['env']['DISPLAY']),
+                         ('/home/desktop', 'desktop', ':test'))
+        self.assertNotIn('SUDO_UID', opts['env'])
+        self.assertNotIn('ADMIN_ONLY', opts['env'])
+        self.assertFalse(self.directory.exists())
+        self.https.assert_not_called()
+
+    def test_sudo_keeps_root_owned_state_and_delegates_only_browser_sign_in(self):
+        stdin = MagicMock()
+        stdin.isatty.return_value = True
+        args = ['enroll', TEAM, '--config-dir', '/', '-i', 'office']
+        with (patch('os.geteuid', return_value=0), patch.dict(os.environ, SUDO_UID='1234'),
+              patch('sys.stdin', stdin), patch('unwarp.cli.desktop_process_options') as desktop,
+              patch('unwarp.cli.enroll', return_value=('office', 'networkmanager')) as register,
+              patch('unwarp.cli.subprocess.run') as child,
+              contextlib.redirect_stdout(self.output), contextlib.redirect_stderr(self.errors)):
+            self.assertEqual(unwarp.main(args), 0)
+            self.assertIs(register.call_args.kwargs['browser_options'], desktop.return_value)
+            self.assertEqual(unwarp.main([*args, '--manual']), 0)
+            self.assertIsNone(register.call_args.kwargs['browser_options'])
+        self.assertIn('  sudo ', self.output.getvalue())
+        child.assert_not_called()
+        self.https.assert_not_called()
+
+    def test_sudo_recovers_an_unambiguous_local_wayland_display(self):
+        with (patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(self.root)}, clear=True),
+              socket.socket(socket.AF_UNIX) as first, socket.socket(socket.AF_UNIX) as second):
+            first.bind(str(self.root / 'wayland-1'))
+            (self.root / 'wayland-1.lock').touch()
+            self.assertEqual(cli.desktop_process_options(os.geteuid())['env']['WAYLAND_DISPLAY'], 'wayland-1')
+            second.bind(str(self.root / 'wayland-2'))
+            self.assertNotIn('WAYLAND_DISPLAY', cli.desktop_process_options(os.geteuid())['env'])
+
+    def test_system_permission_error_preserves_profile_options_and_registration(self):
+        self.assertEqual(self.enroll('-i', 'office'), 0, self.errors.getvalue())
+        flags = ['profile', '--interface=office', '--backend', 'networkmanager', '--mtu', '1400',
+                 '--dual-stack', '--overwrite', '--reload', '-s', 'manual.example other.example']
+        with (patch('unwarp.backends.networkmanager.deploy_nm_config', side_effect=PermissionError),
+              patch('os.geteuid', return_value=1000), patch('unwarp.cli.checkout_root', return_value=None)):
+            self.connection.getresponse.return_value = reply({'result': LIVE})
+            self.assertEqual(self.cli(*flags), 1)
+            command = shlex.split(self.errors.getvalue().splitlines()[-1])
+            self.assertEqual(command, ['sudo', sys.executable, '-I', '-m', 'unwarp', '--config-dir',
+                                       str(self.directory), *flags])
+            self.errors.seek(0)
+            self.errors.truncate()
+            self.connection.getresponse.return_value = reply({'result': LIVE})
+            self.assertEqual(self.cli(*flags, '-c', str(self.root)), 1)
+            self.assertNotIn('sudo', self.errors.getvalue())
+        self.assertEqual(self.connection.request.call_count, 3)
+
     def test_interface_allocation_and_explicit_names(self):
         self.directory.mkdir(mode=0o700)
         (self.directory / 'unwarp1.json').touch()
@@ -231,6 +327,23 @@ class EnrollmentTest(unittest.TestCase):
 
 
 class BrowserLoginTest(unittest.TestCase):
+    def test_desktop_child_returns_only_the_assertion_over_its_private_socket(self):
+        with (tempfile.TemporaryFile(mode='w+') as terminal, tempfile.TemporaryFile(mode='w+') as output):
+            terminal.write(callback() + '\n')
+            terminal.seek(0)
+            process = dict(env={'PATH': ''}, stdin=terminal, stdout=output, stderr=output)
+            token, account = login.sign_in(TEAM, f'https://{HOST}/warp', False, browser_options=process)
+            self.assertEqual(account, ACCOUNT)
+            self.assertTrue(token.endswith('.signature'))
+            output.seek(0)
+            console = output.read()
+            self.assertIn(f'https://{HOST}/warp', console)
+            self.assertNotIn(token, console)
+            terminal.seek(0)
+            terminal.truncate()
+            with self.assertRaisesRegex(ValueError, 'desktop sign-in'):
+                login.sign_in(TEAM, f'https://{HOST}/warp', False, browser_options=process)
+
     def test_scoped_firefox_handoff_over_loopback(self):
         results = []
         worker = None
