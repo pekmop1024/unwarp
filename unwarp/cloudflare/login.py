@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 
 MAX_CALLBACK = 16384
@@ -147,7 +148,28 @@ class LoginServer(HTTPServer):
         return conn, address
 
 
-def sign_in(team, url, manual):
+def _desktop_sign_in(team, url, process_options):
+    # The unprivileged child keeps the terminal for the link and possible manual input.
+    # Only this socket carries the assertion back to the owner of the registration.
+    parent, child = socket.socketpair()
+    with parent, child:
+        fd = child.fileno()
+        with subprocess.Popen([sys.executable, '-I', __file__, str(fd)], pass_fds=(fd,), **process_options) as helper:
+            child.close()
+            parent.sendall(json.dumps([team, url]).encode())
+            parent.shutdown(socket.SHUT_WR)
+            with parent.makefile('rb') as reply:
+                token = reply.read(MAX_CALLBACK + 1)
+            parent.close()
+            if helper.wait() or not token or len(token) > MAX_CALLBACK:
+                raise ValueError('desktop sign-in did not return a valid enrollment assertion')
+    callback = f'com.cloudflare.warp://{team_host(team)}/auth?' + urlencode({'token': token})
+    return read_assertion(callback, team)
+
+
+def sign_in(team, url, manual, *, browser_options=None):
+    if browser_options is not None:
+        return _desktop_sign_in(team, url, browser_options)
     firefox = shutil.which('firefox') or shutil.which('firefox-esr')
     desktop = os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')
     if manual or not desktop or not firefox or os.geteuid() == 0:
@@ -200,3 +222,19 @@ def sign_in(team, url, manual):
                         browser.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         browser.kill()
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 2 or not sys.argv[1].isdecimal():
+        raise SystemExit('This helper is started by unwarp enroll.')
+    try:
+        with socket.socket(fileno=int(sys.argv[1])) as channel:
+            with channel.makefile('rb') as request:
+                team, url = json.load(request)
+            assertion, _ = sign_in(team, enrollment_url(team, url), False)
+            channel.sendall(assertion.encode('ascii'))
+    except (OSError, ValueError, EOFError) as exc:
+        print(f'Browser sign-in failed: {exc}', file=sys.stderr)
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        raise SystemExit(130)

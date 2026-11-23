@@ -28,13 +28,15 @@ For QR export, run `.venv/bin/python -m pip install '.[qr]'` from the checkout. 
 
 ## Enroll an interface with your team
 
-Run enrollment as your desktop user. Replace `my-team` with your Cloudflare team name.
+Run `enroll` as your desktop user to get the one-time browser link. Replace `my-team` with your Cloudflare team name.
 
 ```sh
 python3 ./unwarp.py enroll my-team
 ```
 
 Open the one-time `127.0.0.1` link printed by unwarp on the same computer. It opens your team's Cloudflare sign-in page in a temporary Firefox profile. Complete your organization's usual login and select **Finish this unwarp sign-in** when Firefox asks where to open the return link. Firefox delivers the answer to the local unwarp process and the temporary profile closes. Unwarp submits the WireGuard public key to Cloudflare and receives the device token and registration ID. [Cloudflare browser enrollment](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/deployment/manual-deployment/) · [Device registration API](https://github.com/AnimMouse/wgcf-mesh/blob/main/API.md#register-a-client-device-with-a-service-token)
+
+For NetworkManager, copy the installation command printed after sign-in. It runs `profile` with administrator privileges and points it at the registration you just saved. You can run it later. If you already enrolled, repeating `enroll` with the same team and `-i IFACE` prints the command again.
 
 Unwarp generates the private key from the operating system's secure random source. It derives the public key locally with X25519, reusing the saved private key if enrollment resumes. Python's integer arithmetic has no constant-time guarantee. [X25519 in RFC 7748](https://datatracker.ietf.org/doc/html/rfc7748#section-5)
 
@@ -52,16 +54,18 @@ Unwarp saves the device credentials and profile UUID in `<interface>.json`. A so
 
 Pass `--config-dir DIR` to select the same directory for `enroll`, `profile` and `routes`. When switching from a checkout to the installed command, point it at the checkout's existing `config/` to reuse an enrollment. For installed commands run through sudo or cron, pass the absolute path used by the enrolling user.
 
-Use `--manual` for SSH or another browser. Unwarp also uses this mode when Firefox or a desktop session is unavailable, or when run as root. Follow the printed Cloudflare link and paste the completed `com.cloudflare.warp://…/auth?token=…` link into the waiting terminal. Cloudflare documents how to copy it from the success page. If your team requires an active enrollment URL, pass its HTTPS link with `--login-url`. An invalid enrollment session requires a fresh sign-in. [Cloudflare manual enrollment](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/deployment/manual-deployment/)
+If you start interactive enrollment with `sudo`, unwarp opens Firefox as the user who invoked sudo. A new registration in your home directory belongs to that user. For a root-owned configuration directory, unwarp keeps the registration there and runs just the sign-in process as the desktop user. If sudo has hidden the graphical session, `--manual` lets you finish the same enrollment in another browser.
+
+Use `--manual` for SSH or another browser. Unwarp also uses manual sign-in when Firefox or a desktop session is unavailable, or when run directly as root. Follow the printed Cloudflare link and paste the completed `com.cloudflare.warp://…/auth?token=…` link into the waiting terminal. Cloudflare documents how to copy it from the success page. If your team requires an active enrollment URL, pass its HTTPS link with `--login-url`. An invalid enrollment session requires a fresh sign-in. [Cloudflare manual enrollment](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/deployment/manual-deployment/)
 
 To continue an interrupted sign-in, repeat `enroll` with the printed interface name, for example `-i unwarp0`. A completed configuration is reused. If the registration request was interrupted after submission, check the device list in Zero Trust before repeating it. Use `--retry-uncertain` with that interface only after confirming a new submission is appropriate.
 
 ## Use an enrolled interface
 
-Generate and reload the NetworkManager profile, then preview or apply the latest policy.
+For an interface called `unwarp0` enrolled in this checkout, the following commands install the system connection, preview the current policy and apply it. The printed installation command includes the actual interface and absolute configuration directory for your enrollment.
 
 ```sh
-sudo python3 ./unwarp.py profile -i unwarp0 -r
+sudo python3 ./unwarp.py --config-dir "$PWD/config" profile -i unwarp0 -r
 python3 ./unwarp.py routes -i unwarp0
 sudo python3 ./unwarp.py routes -i unwarp0 --apply
 ```
