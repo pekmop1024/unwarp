@@ -80,6 +80,10 @@ def parse_args(argv=None):
     if command == 'enroll':
         parser.add_argument('team', help='Cloudflare Zero Trust team name')
         add_naming_options(parser)
+        parser.add_argument('--device-name', metavar='NAME',
+                            help='device name sent to Cloudflare (default: system hostname)')
+        parser.add_argument('--client-version', metavar='VERSION',
+                            help=f'WARP version sent to Cloudflare (default: {cloudflare.DEFAULT_CLIENT_VERSION})')
         parser.add_argument('--manual', action='store_true', help='print the login link and read the callback in the terminal')
         parser.add_argument('--login-url', help='use an active HTTPS enrollment link issued for the same team')
         parser.add_argument('--retry-uncertain', action='store_true',

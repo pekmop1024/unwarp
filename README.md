@@ -40,6 +40,8 @@ For NetworkManager, copy the installation command printed after sign-in. It runs
 
 Unwarp generates the private key from the operating system's secure random source. It derives the public key locally with X25519, reusing the saved private key if enrollment resumes. Python's integer arithmetic has no constant-time guarantee. [X25519 in RFC 7748](https://datatracker.ietf.org/doc/html/rfc7748#section-5)
 
+At enrollment, the Cloudflare device name defaults to the machine's hostname. Unwarp also reports a pinned Linux WARP client version, currently `2026.8.2115.0`. Override either value with `--device-name NAME` or `--client-version VERSION`. Pass the version without the Linux `l-` prefix. Unwarp adds it to the `CF-Client-Version` header. [Cloudflare stable releases for Linux](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/download/#linux)
+
 Without `-i`, enrollment and cached import choose the first available name starting at `unwarp0`. Unwarp checks kernel interfaces, its own `<interface>.json` files and names reserved by the selected backend.
 
 The NetworkManager backend asks the daemon for bound interfaces and scans `*.nmconnection` files in `/etc/NetworkManager/system-connections/` or the directory selected with `-c` for a cached import. Each filename reserves its stem, even if the file cannot be read. A readable profile also reserves the `interface-name` in its `[connection]` section. For example, an inactive `Office.nmconnection` with `interface-name=unwarp0` reserves `unwarp0` even when NetworkManager is stopped.
@@ -47,7 +49,8 @@ The NetworkManager backend asks the daemon for bound interfaces and scans `*.nmc
 Use `-i` to select an exact interface name. The NetworkManager display name defaults to the interface name and can be set independently with `-n`.
 
 ```sh
-python3 ./unwarp.py enroll my-team -i wg-office -n 'Office / VPN 100%'
+python3 ./unwarp.py enroll my-team -i wg-office -n 'Office / VPN 100%' \
+    --device-name 'Office laptop' --client-version 2026.8.2110.0
 ```
 
 Unwarp saves the device credentials and profile UUID in `<interface>.json`. A source checkout uses its own `config/` directory, including when called by absolute path from cron. Git and the distribution archives exclude this directory. An installed copy uses `$XDG_CONFIG_HOME/unwarp/` when `XDG_CONFIG_HOME` is an absolute path, and `~/.config/unwarp/` otherwise. Unwarp creates its directory with mode `0700` and each interface file with mode `0600`.
@@ -58,7 +61,7 @@ If you start interactive enrollment with `sudo`, unwarp opens Firefox as the use
 
 Use `--manual` for SSH or another browser. Unwarp also uses manual sign-in when Firefox or a desktop session is unavailable, or when run directly as root. Follow the printed Cloudflare link and paste the completed `com.cloudflare.warp://…/auth?token=…` link into the waiting terminal. Cloudflare documents how to copy it from the success page. If your team requires an active enrollment URL, pass its HTTPS link with `--login-url`. An invalid enrollment session requires a fresh sign-in. [Cloudflare manual enrollment](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/deployment/manual-deployment/)
 
-To continue an interrupted sign-in, repeat `enroll` with the printed interface name, for example `-i unwarp0`. A completed configuration is reused. If the registration request was interrupted after submission, check the device list in Zero Trust before repeating it. Use `--retry-uncertain` with that interface only after confirming a new submission is appropriate.
+To continue an interrupted sign-in, repeat `enroll` with the printed interface name, for example `-i unwarp0`. The saved device name and client version are reused unless you override them for the next submission. After successful enrollment, repeating the command reuses the completed registration. If the registration request was interrupted after submission, check the device list in Zero Trust before repeating it. Use `--retry-uncertain` with that interface only after confirming a new submission is appropriate.
 
 ## Use an enrolled interface
 
@@ -70,7 +73,9 @@ python3 ./unwarp.py routes -i unwarp0
 sudo python3 ./unwarp.py routes -i unwarp0 --apply
 ```
 
-`profile` reads current peer settings and the Include policy from Cloudflare. In this example it writes `/etc/NetworkManager/system-connections/unwarp0.nmconnection`. The assigned device policy must allow WireGuard. The saved UUID identifies the profile even if its display name contains spaces, slashes or a percent sign. Use `-c DIR` to write to an existing directory, `-f` to regenerate an existing profile, or `-D` to preview the write. New keyfiles have mode `0600`.
+`profile` combines the device's saved private key with the peer public key, endpoint, interface addresses and Include policy returned by Cloudflare. The API can issue WireGuard settings even when the WARP client's `policy.tunnel_protocol` is empty or set to `masque`. Unwarp checks the peer settings before writing the profile. [Device registration response](https://github.com/AnimMouse/wgcf-mesh/blob/main/API.md#register-a-client-device-with-a-service-token)
+
+In this example, `profile` writes `/etc/NetworkManager/system-connections/unwarp0.nmconnection`. The saved UUID identifies the profile even if its display name contains spaces, slashes or a percent sign. Use `-c DIR` to write to an existing directory, `-f` to regenerate an existing profile, or `-D` to preview the write. New keyfiles have mode `0600`.
 
 `-r` asks NetworkManager to reload profiles. New profiles have autoconnect disabled. To bring up the example tunnel when ready, run `nmcli connection up id unwarp0` with NetworkManager permissions. If you chose a display name with `-n`, use that name or activate the profile by UUID. Profiles and route updates default to IPv4. Pass `--dual-stack` to both `profile` and `routes` to include IPv6.
 

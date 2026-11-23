@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import http.client
 import io
@@ -94,12 +95,14 @@ class EnrollmentTest(unittest.TestCase):
 
     def test_enroll_profile_and_scheduled_routes(self):
         name = ' Отдел / VPN 100% \\HQ\nEU '
-        with patch.dict(os.environ, PATH=str(self.root)):
+        with patch.dict(os.environ, PATH=str(self.root)), patch('socket.gethostname', return_value='office-laptop'):
             self.assertEqual(self.enroll('-n', name), 0, self.errors.getvalue())
         path = self.directory / 'unwarp0.json'
         data = json.loads(path.read_text())
         self.assertEqual(data['state'], 'registered')
         self.assertEqual(data['connection_name'], name)
+        self.assertEqual(data['device_name'], 'office-laptop')
+        self.assertEqual(data['client_version'], cloudflare.DEFAULT_CLIENT_VERSION)
         self.assertEqual(data['account_id'], ACCOUNT)
         self.assertEqual(data['api_token'], DEVICE_TOKEN)
         self.assertEqual(data['secret_key'], PRIVATE)
@@ -109,7 +112,8 @@ class EnrollmentTest(unittest.TestCase):
         self.https.assert_called_once_with('api.devices.cloudflare.com', timeout=20)
         request = self.connection.request.call_args
         self.assertEqual(request.args, ('POST', '/v0/reg'))
-        self.assertEqual(json.loads(request.kwargs['body']), {'type': 'linux', 'key': PUBLIC, 'name': 'unwarp0'})
+        self.assertEqual(json.loads(request.kwargs['body']), {'type': 'linux', 'key': PUBLIC, 'name': 'office-laptop'})
+        self.assertEqual(request.kwargs['headers']['CF-Client-Version'], 'l-' + cloudflare.DEFAULT_CLIENT_VERSION)
         self.assertTrue(request.kwargs['headers']['Cf-Access-Jwt-Assertion'].endswith('.signature'))
 
         self.connection.getresponse.return_value = reply({'result': LIVE})
@@ -137,6 +141,59 @@ class EnrollmentTest(unittest.TestCase):
         self.assertEqual(self.connection.request.call_count, 3)
         for secret in (DEVICE_TOKEN, PRIVATE, '.signature'):
             self.assertNotIn(secret, self.output.getvalue() + self.errors.getvalue())
+
+    def test_custom_enrollment_metadata_survives_an_interrupted_login(self):
+        options = ('-i', 'vpn', '-n', 'Work VPN',
+                   '--device-name', 'Ноутбук QA', '--client-version', '2026.8-lab')
+        with patch('socket.gethostname', side_effect=AssertionError('unexpected hostname lookup')):
+            self.assertEqual(self.enroll(*options, browser_callback=callback(exp=0)), 1)
+            self.https.assert_not_called()
+            self.assertEqual(self.enroll('-i', 'vpn'), 0, self.errors.getvalue())
+            self.assertEqual(self.enroll(*options), 0, self.errors.getvalue())
+            for flag in ('--device-name', '--client-version'):
+                self.assertEqual(self.enroll('-i', 'vpn', flag, 'different'), 1)
+                self.assertIn('vpn is already registered', self.errors.getvalue())
+        self.assertEqual(self.connection.request.call_count, 1)
+        request = self.connection.request.call_args.kwargs
+        self.assertEqual(json.loads(request['body'])['name'], 'Ноутбук QA')
+        self.assertEqual(request['headers']['CF-Client-Version'], 'l-2026.8-lab')
+        config = json.loads((self.directory / 'vpn.json').read_text())
+        self.assertEqual((config['interface'], config['connection_name']), ('vpn', 'Work VPN'))
+        self.assertEqual((config['device_name'], config['client_version']), ('Ноутбук QA', '2026.8-lab'))
+
+    def test_legacy_enrollments_and_independent_metadata_overrides(self):
+        path = self.directory / 'vpn.json'
+        self.assertEqual(self.enroll('-i', 'vpn', browser_callback=callback(exp=0)), 1)
+        data = json.loads(path.read_text())
+        del data['device_name'], data['client_version']
+        path.write_text(json.dumps(data))
+        with patch('socket.gethostname', return_value='lab-host'):
+            status = self.enroll('-i', 'vpn', '--client-version', 'lab.1', browser_callback=callback(exp=0))
+            self.assertEqual(status, 1)
+        pending = json.loads(path.read_text())
+        self.assertEqual((pending['device_name'], pending['client_version']), ('lab-host', 'lab.1'))
+        self.https.assert_not_called()
+        self.assertEqual(self.enroll('-i', 'vpn', '--device-name', 'QA laptop'), 0, self.errors.getvalue())
+        request = self.connection.request.call_args.kwargs
+        self.assertEqual(json.loads(request['body'])['name'], 'QA laptop')
+        self.assertEqual(request['headers']['CF-Client-Version'], 'l-lab.1')
+        registered = json.loads(path.read_text())
+        del registered['device_name'], registered['client_version']
+        path.write_text(json.dumps(registered))
+        self.assertEqual(self.enroll('-i', 'vpn'), 0, self.errors.getvalue())
+        self.assertEqual(json.loads(path.read_text()), registered)
+        self.assertEqual(self.connection.request.call_count, 1)
+
+    def test_invalid_metadata_is_rejected_before_login(self):
+        with patch('unwarp.profiles.sign_in') as sign_in:
+            for flag, value in (('--device-name', ' '), ('--device-name', 'я' * 51),
+                                ('--client-version', ''), ('--client-version', '1\r\nX-Header: value')):
+                with self.subTest(flag=flag, value=value):
+                    self.assertEqual(self.enroll('-i', 'vpn', flag, value), 1)
+                    self.assertIn(flag, self.errors.getvalue())
+        sign_in.assert_not_called()
+        self.https.assert_not_called()
+        self.assertFalse((self.directory / 'vpn.json').exists())
 
     def test_enrollment_prints_reusable_system_profile_command(self):
         self.directory = self.root / "user's registrations"
@@ -258,8 +315,7 @@ class EnrollmentTest(unittest.TestCase):
         (self.keyfiles / 'Other.nmconnection').write_text(
             '[DEFAULT]\ninterface-name=unwarp3\n[connection]\nid=Other\n[vpn]\ninterface-name=unwarp3\n')
         self.assertEqual(self.enroll(), 0, self.errors.getvalue())
-        self.assertEqual(json.loads(self.connection.request.call_args.kwargs['body'])['name'], 'unwarp3')
-        self.assertTrue((self.directory / 'unwarp3.json').is_file())
+        self.assertEqual(json.loads((self.directory / 'unwarp3.json').read_text())['interface'], 'unwarp3')
 
     def test_bad_login_never_submits_and_can_resume(self):
         for wrong in (callback(exp=0), callback(warp=False), callback(iss='https://other.example'),
@@ -314,11 +370,50 @@ class EnrollmentTest(unittest.TestCase):
         self.assertEqual(self.cli('profile', '-i', 'vpn', '-f', '-c', str(self.root)), 1)
         self.assertIn('uuid=unrelated', target.read_text())
         data = json.loads((self.directory / 'vpn.json').read_text())
-        self.connection.getresponse.return_value = reply({'result': {**LIVE, 'policy': {**POLICY, 'tunnel_protocol': 'masque'}}})
-        with self.assertRaisesRegex(ValueError, 'WireGuard'):
+        self.connection.getresponse.return_value = reply({'result': {**LIVE, 'key': 'changed-device-key'}})
+        with self.assertRaisesRegex(ValueError, 'registered WireGuard public key has changed'):
             cloudflare.fetch_tunnel(data, True)
         self.connection.getresponse.return_value = reply({'result': LIVE})
+        with self.assertRaisesRegex(ValueError, 'WireGuard private key'):
+            cloudflare.fetch_tunnel({**data, 'secret_key': 'invalid-test-key'}, True)
+        self.connection.getresponse.return_value = reply({'result': LIVE})
         self.assertEqual(cloudflare.fetch_tunnel(data, False).address6, '2001:db8::1/128')
+
+    def test_profile_uses_issued_wireguard_peer_regardless_of_warp_protocol(self):
+        self.assertEqual(self.enroll('-i', 'vpn'), 0)
+        target = self.root / 'vpn.nmconnection'
+        peer_key = base64.b64encode(b'P' * 32).decode('ascii')
+        peer = {**LIVE['config']['peers'][0], 'public_key': peer_key}
+        config = {**LIVE['config'], 'peers': [peer]}
+        for protocol in ({}, {'tunnel_protocol': ''}, {'tunnel_protocol': None}, {'tunnel_protocol': 'masque'}):
+            with self.subTest(protocol=protocol):
+                policy = {'include': POLICY['include'], **protocol}
+                self.connection.getresponse.return_value = reply({'result': {**LIVE, 'policy': policy, 'config': config}})
+                self.assertEqual(self.cli('profile', '-i', 'vpn', '-c', str(self.root)), 0, self.errors.getvalue())
+                profile = target.read_text()
+                self.assertIn(f'[wireguard-peer.{peer_key}]', profile)
+                self.assertIn('endpoint = 198.51.100.1:2408', profile)
+                self.assertIn('192.0.2.0/24', profile)
+                target.unlink()
+
+    def test_profile_requires_usable_wireguard_settings_from_cloudflare(self):
+        self.assertEqual(self.enroll('-i', 'vpn'), 0)
+        peer = LIVE['config']['peers'][0]
+        policy = {**POLICY, 'tunnel_protocol': 'masque'}
+        for peers, error in (
+                ([], 'WireGuard tunnel settings'),
+                ([{**peer, 'public_key': base64.b64encode(b'P' * 65).decode('ascii')}], 'WireGuard peer public key'),
+                ([{**peer, 'public_key': 'malformed-test-key'}], 'WireGuard peer public key'),
+                ([{**peer, 'endpoint': {'v4': '198.51.100.1:0', 'ports': []}}], 'WireGuard endpoint port')):
+            with self.subTest(error=error):
+                device = {**LIVE, 'policy': policy, 'config': {**LIVE['config'], 'peers': peers}}
+                self.connection.getresponse.return_value = reply({'result': device})
+                self.errors = io.StringIO()
+                self.assertEqual(self.cli('profile', '-i', 'vpn', '-c', str(self.root)), 1)
+                self.assertIn(error, self.errors.getvalue())
+                self.assertFalse((self.root / 'vpn.nmconnection').exists())
+                for secret in (PRIVATE, DEVICE_TOKEN, 'malformed-test-key'):
+                    self.assertNotIn(secret, self.errors.getvalue())
 
     def test_concurrent_enrollment(self):
         with profiles.enrollment_directory(self.directory):

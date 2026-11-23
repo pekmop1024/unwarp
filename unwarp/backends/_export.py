@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import ipaddress
 import logging
 import re
@@ -11,6 +10,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from ..domains import plan_dns_domains, report_domains
+from ..keys import is_wireguard_key
 from ..model import (ProfileTarget, RouteOptions, RoutePolicy, WireGuardTunnel, WriteOptions,
                      dns_suffix, interface_name, policy_search_domains)
 from ._files import Artifact, existing_file, locked_directory, publish, read_profile
@@ -42,11 +42,7 @@ def allowed_networks(policy, options, previous):
 
 def validate_tunnel(tunnel, options):
     for key in (tunnel.private_key, tunnel.peer_public_key):
-        try:
-            valid = len(base64.b64decode(key, validate=True)) == 32
-        except (ValueError, TypeError):
-            valid = False
-        if not valid:
+        if not is_wireguard_key(key):
             raise ValueError('expected a base64-encoded 32-byte WireGuard key')
     endpoint = re.fullmatch(r'(?:[a-zA-Z0-9_.-]+|\[[a-fA-F0-9:.]+\]):([0-9]{1,5})', tunnel.endpoint)
     if not endpoint or not 1 <= int(endpoint[1]) <= 65535:

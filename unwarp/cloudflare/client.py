@@ -1,6 +1,5 @@
 """Registration, device policy and WireGuard settings from the Cloudflare device API and WARP cache."""
 
-import base64
 import http.client
 import ipaddress
 import json
@@ -8,10 +7,12 @@ import re
 import uuid
 from contextlib import closing
 
+from ..keys import is_wireguard_key
 from ..model import RoutePolicy, WireGuardTunnel
 
 
 DEVICE_HOST = 'api.devices.cloudflare.com'
+DEFAULT_CLIENT_VERSION = '2026.8.2115.0'
 REGISTRATION_FILE = '/var/lib/cloudflare-warp/reg.json'
 WARP_CONFIG_FILE = '/var/lib/cloudflare-warp/conf.json'
 
@@ -28,10 +29,11 @@ class EnrollmentRejected(ValueError):
     """The device API explicitly rejected the registration."""
 
 
-def register_device(team, interface, public_key, assertion):
+def register_device(team, device_name, public_key, assertion, *, client_version=DEFAULT_CLIENT_VERSION):
     headers = {'Content-Type': 'application/json', 'Accept': 'application/json',
-               'User-Agent': 'unwarp', 'Cf-Access-Jwt-Assertion': assertion}
-    body = json.dumps({'type': 'linux', 'name': interface, 'key': public_key})
+               'User-Agent': 'unwarp', 'Cf-Access-Jwt-Assertion': assertion,
+               'CF-Client-Version': f'l-{client_version}'}
+    body = json.dumps({'type': 'linux', 'name': device_name, 'key': public_key})
     with closing(http.client.HTTPSConnection(DEVICE_HOST, timeout=20)) as conn:
         conn.request('POST', '/v0/reg', body=body, headers=headers)
         with conn.getresponse() as response:
@@ -190,16 +192,19 @@ def fetch_tunnel(registration, ipv4_only) -> WireGuardTunnel:
     device = fetch_device(registration)
     if 'key' in device and device['key'] != registration.get('public_key'):
         raise ValueError('the registered WireGuard public key has changed')
-    policy = device['policy']
-    if str(policy.get('tunnel_protocol', 'wireguard')).lower() != 'wireguard':
-        raise ValueError('the Cloudflare device policy does not select WireGuard')
+    private_key = registration.get('secret_key')
+    if isinstance(private_key, str):
+        private_key = private_key.rstrip(' \t\r\n\v\f')
+    if not is_wireguard_key(private_key):
+        raise ValueError('the saved registration is missing a valid WireGuard private key')
+    # WARP's policy.tunnel_protocol can be empty or "masque" even when the API issues a WireGuard peer.
     try:
         config = device['config']
         addresses = config['interface']['addresses']
         peer = config['peers'][0]
-        public = peer['public_key']
-        if len(base64.b64decode(public, validate=True)) != 32:
-            raise ValueError('invalid peer public key')
+        public = peer.get('public_key')
+        if not is_wireguard_key(public):
+            raise ValueError('the device response is missing a valid 32-byte WireGuard peer public key')
         endpoint = peer['endpoint']
         address, _, raw_port = endpoint['v4'].partition(':')
         address = ipaddress.IPv4Address(address)
@@ -209,6 +214,6 @@ def fetch_tunnel(registration, ipv4_only) -> WireGuardTunnel:
                          if type(p) is int and 1 <= p <= 65535), 0)
         if not 1 <= port <= 65535:
             raise ValueError('no usable WireGuard endpoint port in the registration')
-        return _tunnel(registration['secret_key'], public, f'{address}:{port}', addresses, ipv4_only, policy)
+        return _tunnel(private_key, public, f'{address}:{port}', addresses, ipv4_only, device['policy'])
     except (KeyError, IndexError, AttributeError, TypeError):
         raise ValueError('the device response is missing WireGuard tunnel settings') from None
