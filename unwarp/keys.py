@@ -4,6 +4,14 @@ import base64
 from secrets import token_bytes
 
 
+def is_wireguard_key(value: str) -> bool:
+    """Check the base64 encoding and length of a WireGuard key."""
+    try:
+        return len(base64.b64decode(value, validate=True)) == 32
+    except (ValueError, TypeError):
+        return False
+
+
 def _clamp(raw: bytes) -> bytes:
     scalar = bytearray(raw)
     scalar[0] &= 248

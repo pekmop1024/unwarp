@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import http.client
 import io
@@ -314,11 +315,50 @@ class EnrollmentTest(unittest.TestCase):
         self.assertEqual(self.cli('profile', '-i', 'vpn', '-f', '-c', str(self.root)), 1)
         self.assertIn('uuid=unrelated', target.read_text())
         data = json.loads((self.directory / 'vpn.json').read_text())
-        self.connection.getresponse.return_value = reply({'result': {**LIVE, 'policy': {**POLICY, 'tunnel_protocol': 'masque'}}})
-        with self.assertRaisesRegex(ValueError, 'WireGuard'):
+        self.connection.getresponse.return_value = reply({'result': {**LIVE, 'key': 'changed-device-key'}})
+        with self.assertRaisesRegex(ValueError, 'registered WireGuard public key has changed'):
             cloudflare.fetch_tunnel(data, True)
         self.connection.getresponse.return_value = reply({'result': LIVE})
+        with self.assertRaisesRegex(ValueError, 'WireGuard private key'):
+            cloudflare.fetch_tunnel({**data, 'secret_key': 'invalid-test-key'}, True)
+        self.connection.getresponse.return_value = reply({'result': LIVE})
         self.assertEqual(cloudflare.fetch_tunnel(data, False).address6, '2001:db8::1/128')
+
+    def test_profile_uses_issued_wireguard_peer_regardless_of_warp_protocol(self):
+        self.assertEqual(self.enroll('-i', 'vpn'), 0)
+        target = self.root / 'vpn.nmconnection'
+        peer_key = base64.b64encode(b'P' * 32).decode('ascii')
+        peer = {**LIVE['config']['peers'][0], 'public_key': peer_key}
+        config = {**LIVE['config'], 'peers': [peer]}
+        for protocol in ({}, {'tunnel_protocol': ''}, {'tunnel_protocol': None}, {'tunnel_protocol': 'masque'}):
+            with self.subTest(protocol=protocol):
+                policy = {'include': POLICY['include'], **protocol}
+                self.connection.getresponse.return_value = reply({'result': {**LIVE, 'policy': policy, 'config': config}})
+                self.assertEqual(self.cli('profile', '-i', 'vpn', '-c', str(self.root)), 0, self.errors.getvalue())
+                profile = target.read_text()
+                self.assertIn(f'[wireguard-peer.{peer_key}]', profile)
+                self.assertIn('endpoint = 198.51.100.1:2408', profile)
+                self.assertIn('192.0.2.0/24', profile)
+                target.unlink()
+
+    def test_profile_requires_usable_wireguard_settings_from_cloudflare(self):
+        self.assertEqual(self.enroll('-i', 'vpn'), 0)
+        peer = LIVE['config']['peers'][0]
+        policy = {**POLICY, 'tunnel_protocol': 'masque'}
+        for peers, error in (
+                ([], 'WireGuard tunnel settings'),
+                ([{**peer, 'public_key': base64.b64encode(b'P' * 65).decode('ascii')}], 'WireGuard peer public key'),
+                ([{**peer, 'public_key': 'malformed-test-key'}], 'WireGuard peer public key'),
+                ([{**peer, 'endpoint': {'v4': '198.51.100.1:0', 'ports': []}}], 'WireGuard endpoint port')):
+            with self.subTest(error=error):
+                device = {**LIVE, 'policy': policy, 'config': {**LIVE['config'], 'peers': peers}}
+                self.connection.getresponse.return_value = reply({'result': device})
+                self.errors = io.StringIO()
+                self.assertEqual(self.cli('profile', '-i', 'vpn', '-c', str(self.root)), 1)
+                self.assertIn(error, self.errors.getvalue())
+                self.assertFalse((self.root / 'vpn.nmconnection').exists())
+                for secret in (PRIVATE, DEVICE_TOKEN, 'malformed-test-key'):
+                    self.assertNotIn(secret, self.errors.getvalue())
 
     def test_concurrent_enrollment(self):
         with profiles.enrollment_directory(self.directory):

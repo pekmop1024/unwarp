@@ -70,7 +70,9 @@ python3 ./unwarp.py routes -i unwarp0
 sudo python3 ./unwarp.py routes -i unwarp0 --apply
 ```
 
-`profile` reads current peer settings and the Include policy from Cloudflare. In this example it writes `/etc/NetworkManager/system-connections/unwarp0.nmconnection`. The assigned device policy must allow WireGuard. The saved UUID identifies the profile even if its display name contains spaces, slashes or a percent sign. Use `-c DIR` to write to an existing directory, `-f` to regenerate an existing profile, or `-D` to preview the write. New keyfiles have mode `0600`.
+`profile` combines the device's saved private key with the peer public key, endpoint, interface addresses and Include policy returned by Cloudflare. The API can issue WireGuard settings even when the WARP client's `policy.tunnel_protocol` is empty or set to `masque`. Unwarp checks the peer settings before writing the profile. [Device registration response](https://github.com/AnimMouse/wgcf-mesh/blob/main/API.md#register-a-client-device-with-a-service-token)
+
+In this example, `profile` writes `/etc/NetworkManager/system-connections/unwarp0.nmconnection`. The saved UUID identifies the profile even if its display name contains spaces, slashes or a percent sign. Use `-c DIR` to write to an existing directory, `-f` to regenerate an existing profile, or `-D` to preview the write. New keyfiles have mode `0600`.
 
 `-r` asks NetworkManager to reload profiles. New profiles have autoconnect disabled. To bring up the example tunnel when ready, run `nmcli connection up id unwarp0` with NetworkManager permissions. If you chose a display name with `-n`, use that name or activate the profile by UUID. Profiles and route updates default to IPv4. Pass `--dual-stack` to both `profile` and `routes` to include IPv6.
 
