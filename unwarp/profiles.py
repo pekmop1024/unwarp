@@ -4,13 +4,14 @@ import fcntl
 import http.client
 import json
 import os
+import socket
 import tempfile
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
 from .backends import DEFAULT_BACKEND, get_backend
-from .cloudflare.client import EnrollmentRejected, register_device
+from .cloudflare.client import DEFAULT_CLIENT_VERSION, EnrollmentRejected, register_device
 from .cloudflare.login import enrollment_url, sign_in
 from .keys import derive_public_key, generate_private_key
 from .model import ProfileTarget, connection_name, interface_name
@@ -109,6 +110,22 @@ def save_config(path, data, directory_fd):
             Path(output.name).unlink(missing_ok=True)
 
 
+def enrollment_metadata(args, data):
+    device_name = args.device_name if args.device_name is not None else data.get('device_name')
+    if device_name is None:
+        device_name = socket.gethostname()
+    if not isinstance(device_name, str) or not device_name.strip() or len(device_name.encode('utf-8')) > 100:
+        raise ValueError('--device-name must be nonempty and at most 100 UTF-8 bytes')
+
+    client_version = args.client_version
+    if client_version is None:
+        client_version = data.get('client_version', DEFAULT_CLIENT_VERSION)
+    if not (isinstance(client_version, str) and client_version.isascii()
+            and client_version.isprintable() and client_version.strip()):
+        raise ValueError('--client-version must be a nonempty printable ASCII string')
+    return device_name, client_version
+
+
 def enroll(args, *, browser_options=None):
     team = args.team.lower()
     url = enrollment_url(team, args.login_url)
@@ -133,6 +150,10 @@ def enroll(args, *, browser_options=None):
             if data['state'] == 'registered':
                 if not data.get('api_token') or not data.get('registration_id'):
                     raise ValueError('the saved interface config is missing the Cloudflare registration')
+                if ((args.device_name is not None and args.device_name != data.get('device_name', interface))
+                        or (args.client_version is not None and args.client_version != data.get('client_version'))):
+                    raise ValueError(f'{interface} is already registered. The device name and client version '
+                                     'can only be set during enrollment')
                 print(f'{interface} is already registered. Config: {path}')
                 return interface, data.get('backend', DEFAULT_BACKEND)
             if data['state'] == 'submitting' and not args.retry_uncertain:
@@ -142,14 +163,16 @@ def enroll(args, *, browser_options=None):
             name = connection_name(interface if args.profile_name is None else args.profile_name)
             data = {'interface': interface, 'connection_name': name, 'connection_uuid': str(uuid.uuid4()),
                     'backend': backend_name, 'team': team, 'state': 'pending', 'secret_key': generate_private_key()}
-            save_config(path, data, fd)
-        print(f'Enrolling interface {interface}. Config: {path}', flush=True)
+        device_name, client_version = enrollment_metadata(args, data)
         public_key = derive_public_key(data['secret_key'])
+        data.update(device_name=device_name, client_version=client_version)
+        save_config(path, data, fd)
+        print(f'Enrolling interface {interface}. Config: {path}', flush=True)
         assertion, account = sign_in(team, url, args.manual, browser_options=browser_options)
         data['state'] = 'submitting'
         save_config(path, data, fd)
         try:
-            device_id, token = register_device(team, interface, public_key, assertion)
+            device_id, token = register_device(team, device_name, public_key, assertion, client_version=client_version)
         except EnrollmentRejected:
             data['state'] = 'pending'
             save_config(path, data, fd)

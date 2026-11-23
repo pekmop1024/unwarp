@@ -12,6 +12,7 @@ from ..model import RoutePolicy, WireGuardTunnel
 
 
 DEVICE_HOST = 'api.devices.cloudflare.com'
+DEFAULT_CLIENT_VERSION = '2026.8.2115.0'
 REGISTRATION_FILE = '/var/lib/cloudflare-warp/reg.json'
 WARP_CONFIG_FILE = '/var/lib/cloudflare-warp/conf.json'
 
@@ -28,10 +29,11 @@ class EnrollmentRejected(ValueError):
     """The device API explicitly rejected the registration."""
 
 
-def register_device(team, interface, public_key, assertion):
+def register_device(team, device_name, public_key, assertion, *, client_version=DEFAULT_CLIENT_VERSION):
     headers = {'Content-Type': 'application/json', 'Accept': 'application/json',
-               'User-Agent': 'unwarp', 'Cf-Access-Jwt-Assertion': assertion}
-    body = json.dumps({'type': 'linux', 'name': interface, 'key': public_key})
+               'User-Agent': 'unwarp', 'Cf-Access-Jwt-Assertion': assertion,
+               'CF-Client-Version': f'l-{client_version}'}
+    body = json.dumps({'type': 'linux', 'name': device_name, 'key': public_key})
     with closing(http.client.HTTPSConnection(DEVICE_HOST, timeout=20)) as conn:
         conn.request('POST', '/v0/reg', body=body, headers=headers)
         with conn.getresponse() as response:
